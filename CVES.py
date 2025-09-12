@@ -1,5 +1,9 @@
 import os
 import re
+import json
+import csv
+import argparse
+import concurrent.futures
 
 # Map of file extensions to language
 LANG_EXTENSIONS = {
@@ -132,94 +136,34 @@ RACE_CONDITION_PATTERNS = [
 # Privilege Escalation Patterns
 PRIVILEGE_ESCALATION_PATTERNS = [
     r"(?i)sudo\s+",  # Use of sudo without proper validation
-    r"(?i)chmod\s*777",  # Setting permissions to 777 (world writable)
-    r"(?i)setuid\s*\(",  # setuid system call (privilege escalation)
+    r"(?i)chmod\s+777\s+",  # Weak file permissions
+    r"(?i)chown\s+",  # Changing ownership of files
 ]
 
-# Extended unsafe patterns grouped by language
+# List of all patterns for easy use
 LANGUAGE_PATTERNS = {
-    'python': [
-        r"(?i)subprocess\.(call|Popen)\s*\(",  # Dangerous subprocess calls
-        r"(?i)eval\s*\(",  # eval (code injection)
-        r"(?i)exec\s*\(",  # exec (code injection)
-        r"(?i)pickle\.load\s*\(",  # Insecure deserialization
-        r"(?i)open\s*\(\s*\"[^\"]+\"",  # File operations
-        r"(?i)os\.system\s*\(",  # os.system (command injection)
-        r"(?i)os\.popen\s*\(",  # os.popen (command injection)
-        *SQL_INJECTION_PATTERNS,
-        *XSS_PATTERNS,
-        *COMMAND_INJECTION_PATTERNS,
-        *PATH_TRAVERSAL_PATTERNS,
-        *INSECURE_DESERIALIZATION_PATTERNS,
-        *BUFFER_OVERFLOW_PATTERNS,
-    ],
-    'javascript': [
-        r"(?i)child_process\.exec\s*\(",  # Unsafe child process execution
-        r"(?i)eval\s*\(",  # eval (code injection)
-        r"(?i)Function\s*\(",  # Function constructor (code injection)
-        r"(?i)JSON\.parse\s*\(",  # Unsafe JSON.parse
-        r"(?i)__proto__\s*=",  # Prototype pollution
-        r"(?i)--",  # SQL injection attempt
-        r"(?i)/\*",  # SQL injection attempt
-        r"(?i)\"[^\"]+\s*\+\s*\w+\s*\+\s*\"'",  # String concatenation in queries
-        r"(?i)\.\./",  # Path traversal
-        *SQL_INJECTION_PATTERNS,
-        *XSS_PATTERNS,
-        *COMMAND_INJECTION_PATTERNS,
-        *PATH_TRAVERSAL_PATTERNS,
-        *INSECURE_DESERIALIZATION_PATTERNS,
-        *BUFFER_OVERFLOW_PATTERNS,
-    ],
-    'c': [
-        r"(?i)system\s*\(",  # system() call (command injection)
-        r"(?i)popen\s*\(",  # popen() call (command injection)
-        r"(?i)execl\s*\(",  # exec calls
-        r"(?i)strcpy\s*\(",  # strcpy() buffer overflow
-        r"(?i)memcpy\s*\(",  # memcpy() buffer overflow
-        r"(?i)gets\s*\(",  # gets() buffer overflow
-        *SQL_INJECTION_PATTERNS,
-        *BUFFER_OVERFLOW_PATTERNS,
-        *COMMAND_INJECTION_PATTERNS,
-    ],
-    'cpp': [
-        r"(?i)system\s*\(",  # system() call (command injection)
-        r"(?i)popen\s*\(",  # popen() call (command injection)
-        r"(?i)strcpy\s*\(",  # strcpy() buffer overflow
-        r"(?i)memcpy\s*\(",  # memcpy() buffer overflow
-        r"(?i)rand\(\)",  # Random number generation
-        r"(?i)\.\./",  # Path traversal
-        *SQL_INJECTION_PATTERNS,
-        *BUFFER_OVERFLOW_PATTERNS,
-        *COMMAND_INJECTION_PATTERNS,
-    ],
-    'java': [
-        r"(?i)Runtime\.getRuntime\s*\(\)\.exec\s*\(",  # Runtime exec (command injection)
-        r"(?i)ObjectInputStream\s*\(",  # Deserialization vulnerability
-        r"(?i)--",  # SQL injection attempt
-        r"(?i)\"http://[^\s]+\"",  # Open redirect
-        *SQL_INJECTION_PATTERNS,
-        *INSECURE_DESERIALIZATION_PATTERNS,
-        *COMMAND_INJECTION_PATTERNS,
-    ],
-    'shell': [
-        r"(?i)`[^`]+`",  # Command substitution
-        r"(?i)eval\s+\(",  # eval() usage
-        r"(?i)\$\([^)]+\)",  # Command substitution
-        r"(?i)rm\s+-rf\s+",  # rm -rf command
-        r"(?i)ncat\s+-l\s+\d+",  # Netcat reverse shell
-        *SQL_INJECTION_PATTERNS,
-        *COMMAND_INJECTION_PATTERNS,
-        *XSS_PATTERNS,
-    ]
+    'python': SQL_INJECTION_PATTERNS + XSS_PATTERNS + COMMAND_INJECTION_PATTERNS,
+    'javascript': XSS_PATTERNS + COMMAND_INJECTION_PATTERNS + INSECURE_API_PATTERNS,
+    'c': SQL_INJECTION_PATTERNS + COMMAND_INJECTION_PATTERNS + BUFFER_OVERFLOW_PATTERNS,
+    'cpp': SQL_INJECTION_PATTERNS + COMMAND_INJECTION_PATTERNS + BUFFER_OVERFLOW_PATTERNS,
+    'java': SQL_INJECTION_PATTERNS + INSECURE_DESERIALIZATION_PATTERNS + IMPROPER_AUTHENTICATION_PATTERNS,
+    'shell': COMMAND_INJECTION_PATTERNS + PRIVILEGE_ESCALATION_PATTERNS,
 }
-def detect_injections_in_file(filepath):
-    _, ext = os.path.splitext(filepath)
-    lang = LANG_EXTENSIONS.get(ext)
-    if not lang:
+
+def load_custom_patterns(config_file):
+    """Load custom patterns from a JSON file."""
+    try:
+        with open(config_file, 'r') as file:
+            return json.load(file)
+    except Exception as e:
+        print(f"Error loading custom patterns: {e}")
         return []
 
-    patterns = LANGUAGE_PATTERNS.get(lang, [])
+def detect_injections_in_file(filepath, patterns):
+    """Detect vulnerabilities in a single file."""
     results = []
+    seen_issues = set()  # Set to track unique vulnerabilities (file, line number)
+    
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             lines = f.readlines()
@@ -229,28 +173,82 @@ def detect_injections_in_file(filepath):
     for i, line in enumerate(lines):
         for pattern in patterns:
             if re.search(pattern, line):
-                results.append(f"{filepath}:{i+1}: {line.strip()}  <-- ⚠️ Potential Vulnerability")
+                issue = (filepath, i + 1)  # Use file path and line number as unique identifier
+                if issue not in seen_issues:
+                    seen_issues.add(issue)
+                    results.append(f"{filepath}:{i + 1}: {line.strip()}  <-- ⚠️ Potential Vulnerability")
+
     return results
 
-def scan_directory_for_injections(root_dir):
+def scan_directory_for_injections(root_dir, patterns):
+    """Scan all files in the directory for potential vulnerabilities."""
     issues_found = []
-    for subdir, _, files in os.walk(root_dir):
-        for file in files:
-            full_path = os.path.join(subdir, file)
-            results = detect_injections_in_file(full_path)
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = []
+        for subdir, _, files in os.walk(root_dir):
+            for file in files:
+                full_path = os.path.join(subdir, file)
+                futures.append(executor.submit(detect_injections_in_file, full_path, patterns))
+        
+        for future in concurrent.futures.as_completed(futures):
+            results = future.result()
             if results:
                 issues_found.extend(results)
-    return issues_found
+
+    # Remove duplicates (same file, same line number, same vulnerability)
+    seen_issues = set()
+    unique_issues = []
+    for issue in issues_found:
+        file, line, content = issue.split(':', 2)
+        issue_tuple = (file, line.strip())  # Unique identifier: (file, line)
+        if issue_tuple not in seen_issues:
+            seen_issues.add(issue_tuple)
+            unique_issues.append(issue)
+
+    return unique_issues
+
+def save_results(issues, output_file, file_format):
+    """Save issues to a file in JSON or CSV format."""
+    if file_format == "json":
+        with open(output_file, "w", encoding='utf-8') as f:
+            json.dump(issues, f, indent=4)
+    elif file_format == "csv":
+        with open(output_file, "w", newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(["File", "Line", "Vulnerability"])
+            for issue in issues:
+                file, line, content = issue.split(":", 2)
+                writer.writerow([file, line.strip(), content.strip()])
+    print(f"Results saved to {output_file}")
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser(description="Static scanner for potential vulnerabilities.")
     parser.add_argument("directory", help="Directory to scan")
+    parser.add_argument("--config", help="Custom pattern configuration file (JSON)", default=None)
+    parser.add_argument("--output", help="Output file name", default="vulnerabilities_report")
+    parser.add_argument("--format", choices=["json", "csv"], default="json", help="Output format (json or csv)")
     args = parser.parse_args()
-    issues = scan_directory_for_injections(args.directory)
+
+    # Load custom patterns from config file if provided
+    custom_patterns = []
+    if args.config:
+        custom_patterns = load_custom_patterns(args.config)
+
+    # Use default patterns plus any custom patterns
+    patterns = []
+    for lang in LANGUAGE_PATTERNS.values():
+        patterns.extend(lang)
+    patterns.extend(custom_patterns)
+
+    # Scan the directory for vulnerabilities
+    issues = scan_directory_for_injections(args.directory, patterns)
+
+    # Output results
     if not issues:
         print("✅ No potential vulnerabilities found.")
     else:
         print("🚨 Potential vulnerabilities detected:\n")
         for issue in issues:
             print(issue)
+        save_results(issues, args.output + "." + args.format, args.format)
+        print(f"\nResults saved to {args.output}.{args.format}")
