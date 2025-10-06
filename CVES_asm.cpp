@@ -8,167 +8,162 @@
 #include <vector>
 #include <regex>
 #include <filesystem>
-#include <future>
 #include <set>
 #include <fstream>
-
+#include <future>  // Added for parallelism
 using namespace std;
 namespace fs = std::filesystem;
-
 struct PatternGroup {
     string name;
-    vector<string> patterns;
+    vector<regex> patterns; // precompiled regexes
 };
-
 // Extended patterns for assembly vulnerabilities
 vector<PatternGroup> get_asm_vuln_patterns() {
     return {
         {"Buffer Overflow / Unsafe Memory Operations", {
-            R"(\bstrcpy\b)",
-            R"(\bstrncpy\b)",
-            R"(\bstrcat\b)",
-            R"(\bstrncat\b)",
-            R"(\bgets\b)",
-            R"(\bscanf\b)",
-            R"(\bfscanf\b)",
-            R"(\bsscanf\b)",
-            R"(\bmemcpy\b)",
-            R"(\bmemmove\b)",
-            R"(\bmovs\b)",             // rep movs / movs without bounds
-            R"(\bstosb\b|\bstosd\b|\bstosw\b)", // repeated store
-            R"(\bcmps\b)",             // repeated compare
-            R"(\blods\b|lodsb|lodsw|lodsd)", 
-            R"(\bxor\s+[a-z0-9]+,\s*\[.*\])",     // XOR reg, [mem]
-            R"(\badd\s+[a-z0-9]+,\s*\[.*\])",
-            R"(\bsub\s+[a-z0-9]+,\s*\[.*\])"
+            regex(R"(\bstrcpy\b)", regex_constants::icase),
+            regex(R"(\bstrncpy\b)", regex_constants::icase),
+            regex(R"(\bstrcat\b)", regex_constants::icase),
+            regex(R"(\bstrncat\b)", regex_constants::icase),
+            regex(R"(\bgets\b)", regex_constants::icase),
+            regex(R"(\bscanf\b)", regex_constants::icase),
+            regex(R"(\bfscanf\b)", regex_constants::icase),
+            regex(R"(\bsscanf\b)", regex_constants::icase),
+            regex(R"(\bmemcpy\b)", regex_constants::icase),
+            regex(R"(\bmemmove\b)", regex_constants::icase),
+            regex(R"(\bmovs\b)", regex_constants::icase),
+            regex(R"(\bstosb\b|\bstosd\b|\bstosw\b)", regex_constants::icase),
+            regex(R"(\bcmps\b)", regex_constants::icase),
+            regex(R"(\blods\b|lodsb|lodsw|lodsd)", regex_constants::icase),
+            regex(R"(\bxor\s+[a-z0-9]+,\s*\[.*\])", regex_constants::icase),
+            regex(R"(\badd\s+[a-z0-9]+,\s*\[.*\])", regex_constants::icase),
+            regex(R"(\bsub\s+[a-z0-9]+,\s*\[.*\])", regex_constants::icase)
         }},
         {"Unsafe Function Call / Library Routines", {
-            R"(\bcall\s+strcpy\b)",
-            R"(\bcall\s+strncpy\b)",
-            R"(\bcall\s+strcat\b)",
-            R"(\bcall\s+strncat\b)",
-            R"(\bcall\s+gets\b)",
-            R"(\bcall\s+scanf\b)",
-            R"(\bcall\s+fscanf\b)",
-            R"(\bcall\s+sscanf\b)",
-            R"(\bcall\s+system\b)",
-            R"(\bcall\s+popen\b)",
-            R"(\bcall\s+execve\b)"
+            regex(R"(\bcall\s+strcpy\b)", regex_constants::icase),
+            regex(R"(\bcall\s+strncpy\b)", regex_constants::icase),
+            regex(R"(\bcall\s+strcat\b)", regex_constants::icase),
+            regex(R"(\bcall\s+strncat\b)", regex_constants::icase),
+            regex(R"(\bcall\s+gets\b)", regex_constants::icase),
+            regex(R"(\bcall\s+scanf\b)", regex_constants::icase),
+            regex(R"(\bcall\s+fscanf\b)", regex_constants::icase),
+            regex(R"(\bcall\s+sscanf\b)", regex_constants::icase),
+            regex(R"(\bcall\s+system\b)", regex_constants::icase),
+            regex(R"(\bcall\s+popen\b)", regex_constants::icase),
+            regex(R"(\bcall\s+execve\b)", regex_constants::icase)
         }},
         {"Hardcoded Secrets / Data Strings", {
-            R"(\bdb\s+\".*password.*\")",
-            R"(\bdb\s+\".*secret.*\")",
-            R"(\bdb\s+\".*key.*\")",
-            R"(\bdb\s+\".*token.*\")",
-            R"(\bdb\s+\".*credential.*\")",
-            R"(\bdata\s+\".*password.*\")",
-            R"(\bdata\s+\".*secret.*\")"
+            regex(R"(\bdb\s+\".*password.*\")", regex_constants::icase),
+            regex(R"(\bdb\s+\".*secret.*\")", regex_constants::icase),
+            regex(R"(\bdb\s+\".*key.*\")", regex_constants::icase),
+            regex(R"(\bdb\s+\".*token.*\")", regex_constants::icase),
+            regex(R"(\bdb\s+\".*credential.*\")", regex_constants::icase),
+            regex(R"(\bdata\s+\".*password.*\")", regex_constants::icase),
+            regex(R"(\bdata\s+\".*secret.*\")", regex_constants::icase)
         }},
         {"Privilege / Permissions / Escalation Instructions", {
-            R"(\biopl\b)",                        // change in I/O privilege level
-            R"(\bitsl\b)",                        // test I/O privilege
-            R"(\bcli\b)",                         // disable interrupts
-            R"(\bsti\b)",                         // enable interrupts
-            R"(\bout\s+)",                       // writing to ports
-            R"(\bin\b)",                         // reading from ports
-            R"(\bint\s+0x80\b.*\bsetuid\b)",
-            R"(\bint\s+0x80\b.*\bsetgid\b)",
-            R"(\bint\s+0x80\b.*\bchmod\b)",
-            R"(\bint\s+0x80\b.*\bchown\b)",
-            R"(\bint\s+0x80\b.*\brwx\b)"
+            regex(R"(\biopl\b)", regex_constants::icase),
+            regex(R"(\bitsl\b)", regex_constants::icase),
+            regex(R"(\bcli\b)", regex_constants::icase),
+            regex(R"(\bsti\b)", regex_constants::icase),
+            regex(R"(\bout\s+)", regex_constants::icase),
+            regex(R"(\bin\b)", regex_constants::icase),
+            regex(R"(\bint\s+0x80\b.*\bsetuid\b)", regex_constants::icase),
+            regex(R"(\bint\s+0x80\b.*\bsetgid\b)", regex_constants::icase),
+            regex(R"(\bint\s+0x80\b.*\bchmod\b)", regex_constants::icase),
+            regex(R"(\bint\s+0x80\b.*\bchown\b)", regex_constants::icase),
+            regex(R"(\bint\s+0x80\b.*\brwx\b)", regex_constants::icase)
         }},
         {"Suspicious Syscalls / Interrupts", {
-            R"(\bint\s+0x80\b)",
-            R"(\bsyscall\b)",
-            R"(\bint\s+0x2e\b)",
-            R"(\bint\s+0x81\b)",
-            R"(\bint\s+0x82\b)", // some other interrupts
-            R"(\bint\s+0x90\b)", // NOP / debug / weird
-            R"(\btrap\b)",
-            R"(\beret\b)"       // maybe suspicious return / misuse
+            regex(R"(\bint\s+0x80\b)", regex_constants::icase),
+            regex(R"(\bsyscall\b)", regex_constants::icase),
+            regex(R"(\bint\s+0x2e\b)", regex_constants::icase),
+            regex(R"(\bint\s+0x81\b)", regex_constants::icase),
+            regex(R"(\bint\s+0x82\b)", regex_constants::icase),
+            regex(R"(\bint\s+0x90\b)", regex_constants::icase),
+            regex(R"(\btrap\b)", regex_constants::icase),
+            regex(R"(\beret\b)", regex_constants::icase)
         }},
         {"Control Flow / Return Oriented Programming (ROP) / Jump Gadgets", {
-            R"(\bjmp\s+[a-zA-Z0-9_]+\b)",         // indirect jumps
-            R"(\bjmp\s*\[.*\])",                   // memory-based jump
-            R"(\bcall\s*\[.*\])",
-            R"(\bpush\s+[^\n]*; ret\b)",            // push + ret combos
-            R"(\bpop\s+[^\n]*; ret\b)",
-            R"(\bret\b)",                          // suspect unless it's function return
-            R"(\bleave\b)",                        // stack frame unwind
+            regex(R"(\bjmp\s+[a-zA-Z0-9_]+\b)", regex_constants::icase),
+            regex(R"(\bjmp\s*\[.*\])", regex_constants::icase),
+            regex(R"(\bcall\s*\[.*\])", regex_constants::icase),
+            regex(R"(\bpush\s+[^\n]*; ret\b)", regex_constants::icase),
+            regex(R"(\bpop\s+[^\n]*; ret\b)", regex_constants::icase),
+            regex(R"(\bret\b)", regex_constants::icase),
+            regex(R"(\bleave\b)", regex_constants::icase)
         }},
         {"Format String / Debug / Info Leakage", {
-            R"(\bodbc\b|\bprintf\b|\bsprintf\b|\bvsprintf\b)",
-            R"(\bprintf\b)",
-            R"(\bsprintf\b)",
-            R"(\bvsprintf\b)",
-            R"(\bwprintf\b)",
-            R"(\bwprintf_s\b)",
-            R"(\bdebug\b)",
-            R"(\bprintk\b)" // kernel debug
+            regex(R"(\bodbc\b|\bprintf\b|\bsprintf\b|\bvsprintf\b)", regex_constants::icase),
+            regex(R"(\bprintf\b)", regex_constants::icase),
+            regex(R"(\bsprintf\b)", regex_constants::icase),
+            regex(R"(\bvsprintf\b)", regex_constants::icase),
+            regex(R"(\bwprintf\b)", regex_constants::icase),
+            regex(R"(\bwprintf_s\b)", regex_constants::icase),
+            regex(R"(\bdebug\b)", regex_constants::icase),
+            regex(R"(\bprintk\b)", regex_constants::icase)
         }},
         {"Arithmetic / Overflow Risks", {
-            R"(\badd\b)",
-            R"(\bsub\b)",
-            R"(\bmul\b)",
-            R"(\bdiv\b)",
-            R"(\bimul\b)",
-            R"(\bdivl\b)",
-            R"(\bjo\b|\bjc\b|\bbe\b|\bja\b|\bjb\b|\bjl\b|\bjg\b)" // jump on overflow/carry
+            regex(R"(\badd\b)", regex_constants::icase),
+            regex(R"(\bsub\b)", regex_constants::icase),
+            regex(R"(\bmul\b)", regex_constants::icase),
+            regex(R"(\bdiv\b)", regex_constants::icase),
+            regex(R"(\bimul\b)", regex_constants::icase),
+            regex(R"(\bdivl\b)", regex_constants::icase),
+            regex(R"(\bjo\b|\bjc\b|\bbe\b|\bja\b|\bjb\b|\bjl\b|\bjg\b)", regex_constants::icase)
         }}
     };
-}
-
+};
 // Execute objdump (disassemble) on a binary
 string exec_objdump(const string& binary_path) {
     array<char, 256> buffer{};
     string result;
-
     string cmd = "objdump -d \"" + binary_path + "\"";
-
     unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
     if (!pipe) {
         throw runtime_error("popen() failed!");
-    }
-
+    };
     while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
         result += buffer.data();
-    }
+    };
     return result;
-}
-
-// Scan asm text with pattern groups
+};
+// Scan asm text with pattern groups (parallelized)
 vector<string> scan_asm_text(const string& asm_text, const vector<PatternGroup>& pattern_groups, const string& source_name = "asm_text") {
     vector<string> results;
-    set<string> seen_issues; // Set to track unique issues (pattern + line number)
-
+    set<string> seen_issues;
     istringstream iss(asm_text);
     string line;
     int line_number = 0;
-
+    vector<future<vector<string>>> tasks;
     while (getline(iss, line)) {
         ++line_number;
-        // Normalize line by removing extra whitespace, which can happen in objdump output
-        string normalized_line = line;
-        normalized_line.erase(remove(normalized_line.begin(), normalized_line.end(), ' '), normalized_line.end());
-        
-        for (const auto& group : pattern_groups) {
-            for (const auto& pattern : group.patterns) {
-                regex re(pattern, regex_constants::icase);
-                if (regex_search(normalized_line, re)) {
-                    // Create a unique issue identifier with both pattern, line number and the actual line content
-                    string issue_identifier = group.name + ":" + to_string(line_number) + ":" + pattern + ":" + normalized_line;
-                    // Ensure uniqueness by checking if this issue has been seen already
-                    if (seen_issues.find(issue_identifier) == seen_issues.end()) {
-                        seen_issues.insert(issue_identifier);  // Add to set if not already seen
-                        results.push_back("[" + group.name + "] " + source_name + ":" + to_string(line_number) + ": " + line);  // Store unique issue
+        // Create task for each line
+        tasks.push_back(async(launch::async, [line, line_number, &pattern_groups, &seen_issues, source_name]() -> vector<string> {
+            vector<string> local_results;
+            // Normalize line: collapse multiple spaces into single space
+            string normalized_line = regex_replace(line, regex("\\s+"), " ");
+            for (const auto& group : pattern_groups) {
+                for (const auto& re : group.patterns) {
+                    if (regex_search(normalized_line, re)) {
+                        string issue_identifier = group.name + ":" + to_string(line_number) + ":" + normalized_line;
+                        if (seen_issues.find(issue_identifier) == seen_issues.end()) {
+                            seen_issues.insert(issue_identifier);
+                            local_results.push_back("[" + group.name + "] " + source_name + ":" + to_string(line_number) + ": " + line);
+                        }
                     }
                 }
             }
-        }
+            return local_results;
+        }));
+    }
+    // Collect results from all tasks
+    for (auto& task : tasks) {
+        auto task_results = task.get();
+        results.insert(results.end(), task_results.begin(), task_results.end());
     }
     return results;
-}
-
+};
 int main(int argc, char** argv) {
     if (argc < 3) {
         cerr << "Usage:\n"
@@ -176,15 +171,12 @@ int main(int argc, char** argv) {
              << "  asm_scanner --bin <binary_file_path>\n";
         return 1;
     }
-
     string mode = argv[1];
     string path = argv[2];
     vector<PatternGroup> patterns = get_asm_vuln_patterns();
     vector<string> issues;
-
     try {
         if (mode == "--asm") {
-            // Load asm file from disk
             ifstream file(path);
             if (!file) {
                 cerr << "Error opening asm file: " << path << endl;
@@ -199,7 +191,6 @@ int main(int argc, char** argv) {
             issues = scan_asm_text(asm_text, patterns, path);
         }
         else if (mode == "--bin") {
-            // Disassemble binary in memory
             string asm_text = exec_objdump(path);
             issues = scan_asm_text(asm_text, patterns, path);
         }
@@ -208,11 +199,10 @@ int main(int argc, char** argv) {
             cerr << "Use --asm or --bin\n";
             return 1;
         }
-
         if (issues.empty()) {
-            cout << "✅ No potential vulnerabilities found.\n";
+            cout << " No potential vulnerabilities found.\n";
         } else {
-            cout << "🚨 Potential vulnerabilities detected:\n";
+            cout << " Potential vulnerabilities detected:\n";
             for (auto& issue : issues) {
                 cout << issue << "\n";
             }
@@ -223,4 +213,4 @@ int main(int argc, char** argv) {
         return 1;
     }
     return 0;
-}
+};
