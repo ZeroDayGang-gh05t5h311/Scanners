@@ -1,7 +1,7 @@
 // cmdinjscanner.cpp
 // Extended: adds POST form testing, cookie/session support, and expanded crawler (recursive)
 // Requires libcurl and C++17
-// Compile: g++ -std=c++17 -lcurl -pthread -o safe_cmdinj_scanner safe_cmdinj_scanner_with_post_and_cookies.cpp
+// Compile: g++ -w cmdinjscanner.cpp -o cmdinjscanner -lcurl -pthread
 #include <iostream>
 #include <string>
 #include <vector>
