@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Safe Reflection / Command-Injection Candidate Scanner (standard-library-only, extended)
-Author: ChatGPT (GPT-5 Thinking mini)
+Author: Gh05t5h311
 Purpose: Find reflected markers in URLs, forms, headers, and discovered resources.
 Extended with:
  - result saving to CSV or plaintext via --output <filename>
