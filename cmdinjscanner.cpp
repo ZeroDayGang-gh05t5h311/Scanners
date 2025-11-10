@@ -1,7 +1,9 @@
-// cmdinjscanner.cpp
-// Extended: adds POST form testing, cookie/session support, and expanded crawler (recursive)
-// Requires libcurl and C++17
-// Compile: g++ -w cmdinjscanner.cpp -o cmdinjscanner -lcurl -pthread
+// safe_cmdinj_scanner_fixed.cpp
+// Extended & fixed: adds POST form testing, cookie/session support, and expanded crawler (recursive)
+// - Fixes: accidental placeholder Form push, better header/free handling, mkstemp cookie file, same-host crawl, dedupe forms/urls
+// - Improvements: polite User-Agent, rate limiting, normalized error indicators, clearer detection logic
+// Compile: g++ -std=c++17 -lcurl -pthread -o safe_cmdinj_scanner_fixed safe_cmdinj_scanner_fixed.cpp
+
 #include <iostream>
 #include <string>
 #include <vector>
@@ -18,12 +20,15 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <cstring>
+#include <unistd.h> // for mkstemp
+
 using namespace std;
 
 static mutex out_mtx;
 static const int MAX_CRAWL_DEPTH = 2; // expanded crawler depth
+static const char* DEFAULT_USER_AGENT = "CmdInjScanner/1.0 (+https://example.com)";
 
-// Simple curl writer
 struct Memory {
     string data;
 };
@@ -44,7 +49,18 @@ string url_encode(const string &value) {
     return out;
 }
 
-// HTTP GET using a provided cookie file (session preservation)
+// Helper: set common curl options
+static void set_common_curl_options(CURL* curl, const string& cookiefile, struct curl_slist* headers) {
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, DEFAULT_USER_AGENT);
+    if (!cookiefile.empty()) {
+        curl_easy_setopt(curl, CURLOPT_COOKIEFILE, cookiefile.c_str());
+        curl_easy_setopt(curl, CURLOPT_COOKIEJAR, cookiefile.c_str());
+    }
+    if (headers) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+}
+
 string http_get_with_cookies(const string& url, long& out_code, double& elapsed, const string& cookiefile, struct curl_slist* headers = nullptr) {
     CURL* curl = curl_easy_init();
     Memory chunk;
@@ -54,17 +70,10 @@ string http_get_with_cookies(const string& url, long& out_code, double& elapsed,
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &chunk);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
-    // cookies
-    if (!cookiefile.empty()) {
-        curl_easy_setopt(curl, CURLOPT_COOKIEFILE, cookiefile.c_str());
-        curl_easy_setopt(curl, CURLOPT_COOKIEJAR, cookiefile.c_str());
-    }
-    if (headers) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    set_common_curl_options(curl, cookiefile, headers);
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
-        // leave data empty
+        // keep body empty on error
     }
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out_code);
     curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &elapsed);
@@ -72,7 +81,6 @@ string http_get_with_cookies(const string& url, long& out_code, double& elapsed,
     return chunk.data;
 }
 
-// HTTP POST form (application/x-www-form-urlencoded) using cookies
 string http_post_with_cookies(const string& url, const string& postfields, long& out_code, double& elapsed, const string& cookiefile, struct curl_slist* headers = nullptr) {
     CURL* curl = curl_easy_init();
     Memory chunk;
@@ -84,29 +92,37 @@ string http_post_with_cookies(const string& url, const string& postfields, long&
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postfields.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &chunk);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
-    if (!cookiefile.empty()) {
-        curl_easy_setopt(curl, CURLOPT_COOKIEFILE, cookiefile.c_str());
-        curl_easy_setopt(curl, CURLOPT_COOKIEJAR, cookiefile.c_str());
-    }
-    // set content-type if not provided
+    // prepare headers: if user passed headers we use them, otherwise create our own list and free it after.
     struct curl_slist* local_headers = nullptr;
+    bool should_free_local_headers = false;
     if (headers) {
         local_headers = headers;
     } else {
         local_headers = curl_slist_append(nullptr, "Content-Type: application/x-www-form-urlencoded");
+        should_free_local_headers = true;
     }
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, local_headers);
+    set_common_curl_options(curl, cookiefile, local_headers);
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
-        // leave data empty
+        // leave body empty
     }
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out_code);
     curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &elapsed);
-    if (local_headers && !headers) curl_slist_free_all(local_headers);
+    if (should_free_local_headers && local_headers) curl_slist_free_all(local_headers);
     curl_easy_cleanup(curl);
     return chunk.data;
+}
+
+// extract host base (scheme+host:port) from a URL
+string extract_origin(const string& url) {
+    try {
+        regex host_re(R"(^((?:https?://[^/]+)))", regex::icase);
+        smatch m;
+        if (regex_search(url, m, host_re)) {
+            return m[1].str();
+        }
+    } catch(...) {}
+    return string();
 }
 
 // find links with query parameters and simple form inputs (superficial)
@@ -128,6 +144,15 @@ vector<string> extract_urls_from_html(const string& base_url, const string& html
                         urls.push_back(m[1].str() + href);
                     }
                 } catch(...) {}
+            } else if (!href.empty() && href[0] != '#') {
+                // relative without leading slash -> append to base path
+                try {
+                    auto qpos = base_url.find('?');
+                    string base = (qpos==string::npos) ? base_url : base_url.substr(0,qpos);
+                    auto last_slash = base.rfind('/');
+                    if (last_slash != string::npos) base = base.substr(0, last_slash+1);
+                    urls.push_back(base + href);
+                } catch(...) {}
             }
         }
         // also scan simple forms (action attr)
@@ -143,6 +168,12 @@ vector<string> extract_urls_from_html(const string& base_url, const string& html
                 if (regex_search(base_url, m, host_re)) {
                     urls.push_back(m[1].str() + action);
                 }
+            } else if (!action.empty()) {
+                auto qpos = base_url.find('?');
+                string base = (qpos==string::npos) ? base_url : base_url.substr(0,qpos);
+                auto last_slash = base.rfind('/');
+                if (last_slash != string::npos) base = base.substr(0, last_slash+1);
+                urls.push_back(base + action);
             }
         }
     } catch(...) {}
@@ -157,6 +188,11 @@ struct Form {
     string action;
     string method; // GET or POST
     map<string,string> inputs; // name -> value (default if available)
+    bool operator<(Form const& o) const {
+        if (action != o.action) return action < o.action;
+        if (method != o.method) return method < o.method;
+        return inputs.size() < o.inputs.size();
+    }
 };
 
 // extract forms and inputs (superficial) from HTML
@@ -195,7 +231,6 @@ vector<Form> extract_forms(const string& base_url, const string& html) {
                     }
                 } else if (f.action.rfind("http://",0) != 0 && f.action.rfind("https://",0) != 0) {
                     // relative path without leading slash: append to base path
-                    // naive: remove query/fragment from base_url
                     auto qpos = base_url.find('?');
                     string base = (qpos==string::npos) ? base_url : base_url.substr(0,qpos);
                     auto last_slash = base.rfind('/');
@@ -204,7 +239,7 @@ vector<Form> extract_forms(const string& base_url, const string& html) {
                 }
             } catch(...) {}
 
-            // find input fields within inner HTML
+            // find input fields within inner HTML (no placeholder bug)
             try {
                 regex input_re(R"((?i)<input\b([^>]*)>)");
                 auto ibegin = sregex_iterator(inner.begin(), inner.end(), input_re);
@@ -218,12 +253,11 @@ vector<Form> extract_forms(const string& base_url, const string& html) {
                         regex value_re(R"((?i)value\s*=\s*['"]([^'"]*)['"])" );
                         smatch vm;
                         if (regex_search(iattrs, vm, value_re)) value = vm[1].str();
-                        // ignore type=submit without name
-                        forms.push_back(Form()); // placeholder to keep indices consistent
-                        f.inputs[name] = value;
+                        // ignore inputs with empty name (rare)
+                        if (!name.empty()) f.inputs[name] = value;
                     }
                 }
-                // also textarea
+                // textarea
                 regex ta_re(R"((?i)<textarea\b([^>]*)>([\s\S]*?)</textarea>)");
                 auto tbegin = sregex_iterator(inner.begin(), inner.end(), ta_re);
                 for (auto it3 = tbegin; it3 != end_it; ++it3) {
@@ -263,6 +297,11 @@ vector<Form> extract_forms(const string& base_url, const string& html) {
             forms.push_back(f);
         }
     } catch(...) {}
+    // de-duplicate similar forms (basic)
+    sort(forms.begin(), forms.end());
+    forms.erase(unique(forms.begin(), forms.end(), [](const Form& a, const Form& b){
+        return a.action==b.action && a.method==b.method && a.inputs==b.inputs;
+    }), forms.end());
     return forms;
 }
 
@@ -311,7 +350,7 @@ vector<string> safe_payloads() {
     };
 }
 
-vector<string> error_indicators() {
+vector<string> raw_error_indicators() {
     return {
         "syntax error", "command not found", "sh:", "bash:", "error executing", "unexpected token",
         "php error", "warning:", "exception", "traceback"
@@ -323,12 +362,26 @@ void safe_println(const string& s) {
     cout << s << endl;
 }
 
+// lowercased indicators prepared once
+vector<string> error_indicators_normalized() {
+    static vector<string> cached;
+    if (!cached.empty()) return cached;
+    for (auto &s : raw_error_indicators()) {
+        string l = s;
+        transform(l.begin(), l.end(), l.begin(), [](unsigned char c){ return tolower(c); });
+        cached.push_back(l);
+    }
+    return cached;
+}
+
 // Test GET parameter (same as before, but uses cookiefile)
 ProbeResult test_parameter_get(const string& base_url, const string& param, const string& baseline_body, long baseline_code, size_t baseline_len, const string& cookiefile) {
     ProbeResult pr;
     pr.url = base_url;
     pr.param = param;
     vector<string> payloads = safe_payloads();
+    auto indicators = error_indicators_normalized();
+
     for (const string& payload : payloads) {
         auto qpos = base_url.find('?');
         if (qpos==string::npos) continue;
@@ -366,12 +419,10 @@ ProbeResult test_parameter_get(const string& base_url, const string& param, cons
         bool status_changed = (code != baseline_code);
         bool length_changed = (len != baseline_len);
         bool suspicious_error = false;
-        for (const auto& ind : error_indicators()) {
-            string lwr = body;
-            transform(lwr.begin(), lwr.end(), lwr.begin(), [](unsigned char c){ return tolower(c); });
-            string lind = ind;
-            transform(lind.begin(), lind.end(), lind.begin(), [](unsigned char c){ return tolower(c); });
-            if (lwr.find(lind) != string::npos) { suspicious_error = true; break; }
+        string lower_body = body;
+        transform(lower_body.begin(), lower_body.end(), lower_body.begin(), [](unsigned char c){ return tolower(c); });
+        for (const auto& ind : indicators) {
+            if (lower_body.find(ind) != string::npos) { suspicious_error = true; break; }
         }
         if (reflected || status_changed || length_changed || suspicious_error) {
             pr.payload = payload;
@@ -387,6 +438,8 @@ ProbeResult test_parameter_get(const string& base_url, const string& param, cons
             pr.note = ss.str();
             return pr;
         }
+        // small polite delay between probes
+        this_thread::sleep_for(chrono::milliseconds(100));
     }
     pr.note = "No suspicious differences detected with safe payloads.";
     return pr;
@@ -398,6 +451,8 @@ ProbeResult test_form_post(const Form& form, const string& param, const string& 
     pr.url = form.action;
     pr.param = param;
     vector<string> payloads = safe_payloads();
+    auto indicators = error_indicators_normalized();
+
     for (const string& payload : payloads) {
         // build postfields by taking all inputs and replacing the one named param
         vector<string> parts;
@@ -419,12 +474,10 @@ ProbeResult test_form_post(const Form& form, const string& param, const string& 
         bool status_changed = (code != baseline_code);
         bool length_changed = (len != baseline_len);
         bool suspicious_error = false;
-        for (const auto& ind : error_indicators()) {
-            string lwr = body;
-            transform(lwr.begin(), lwr.end(), lwr.begin(), [](unsigned char c){ return tolower(c); });
-            string lind = ind;
-            transform(lind.begin(), lind.end(), lind.begin(), [](unsigned char c){ return tolower(c); });
-            if (lwr.find(lind) != string::npos) { suspicious_error = true; break; }
+        string lower_body = body;
+        transform(lower_body.begin(), lower_body.end(), lower_body.begin(), [](unsigned char c){ return tolower(c); });
+        for (const auto& ind : indicators) {
+            if (lower_body.find(ind) != string::npos) { suspicious_error = true; break; }
         }
         if (reflected || status_changed || length_changed || suspicious_error) {
             pr.payload = payload;
@@ -440,6 +493,8 @@ ProbeResult test_form_post(const Form& form, const string& param, const string& 
             pr.note = ss.str();
             return pr;
         }
+        // small polite delay between probes
+        this_thread::sleep_for(chrono::milliseconds(150));
     }
     pr.note = "No suspicious differences detected with safe payloads (POST).";
     return pr;
@@ -457,18 +512,36 @@ int main(int argc, char** argv) {
     bool aggressive = false;
     if (argc >=3 && string(argv[2]) == "--aggressive") aggressive = true;
     curl_global_init(CURL_GLOBAL_DEFAULT);
-    // create a temporary cookie file path in current directory
-    string cookiefile = "scanner_cookies.txt";
-    try {
-        // ensure file exists
-        ofstream cf(cookiefile, ios::app);
-        cf.close();
-    } catch(...) {}
+
+    // create a temporary cookie file securely using mkstemp
+    string cookiefile_template = "scanner_cookies_XXXXXX.txt";
+    vector<char> tmp(cookiefile_template.begin(), cookiefile_template.end());
+    tmp.push_back('\0');
+    int fd = mkstemp(tmp.data());
+    string cookiefile;
+    if (fd != -1) {
+        close(fd); // we'll use the filename; curl will create it
+        cookiefile = string(tmp.data());
+    } else {
+        // fallback to local filename
+        cookiefile = "scanner_cookies.txt";
+        ofstream cf(cookiefile, ios::app); cf.close();
+    }
+
     // Fetch baseline (using cookie/session)
     long base_code = 0; double base_elapsed = 0.0;
     string base_body = http_get_with_cookies(target, base_code, base_elapsed, cookiefile);
     size_t base_len = base_body.size();
     safe_println("[*] Baseline fetched. HTTP code: " + to_string(base_code) + "  length: " + to_string(base_len));
+
+    // Crawl only same-origin pages (politeness & scope)
+    string origin = extract_origin(target);
+    if (origin.empty()) {
+        safe_println("[!] Could not extract origin from target; continuing but scope may be large.");
+    } else {
+        safe_println("[*] Scanning origin: " + origin);
+    }
+
     // Expanded crawler: BFS up to MAX_CRAWL_DEPTH
     vector<string> to_crawl;
     set<string> seen;
@@ -482,9 +555,12 @@ int main(int argc, char** argv) {
             long code=0; double elapsed=0.0;
             string body = http_get_with_cookies(url, code, elapsed, cookiefile);
             if (body.empty()) continue;
-            // extract urls and add unseen
+            // extract urls and add unseen (limit to same-origin if known)
             auto urls = extract_urls_from_html(url, body);
             for (auto &u : urls) {
+                if (!origin.empty()) {
+                    if (u.rfind(origin,0) != 0) continue; // skip other origins
+                }
                 if (seen.insert(u).second) {
                     next_round.push_back(u);
                 }
@@ -494,25 +570,36 @@ int main(int argc, char** argv) {
             for (auto &f : forms) discovered_forms.push_back(f);
             // also consider the page itself for parameter testing
             discovered_urls.push_back(url);
+            // polite short delay to avoid hammering
+            this_thread::sleep_for(chrono::milliseconds(100));
         }
         to_crawl = move(next_round);
         if (to_crawl.empty()) break;
     }
-    // dedupe discovered_urls
+    // dedupe discovered_urls & discovered_forms
     sort(discovered_urls.begin(), discovered_urls.end());
     discovered_urls.erase(unique(discovered_urls.begin(), discovered_urls.end()), discovered_urls.end());
+
+    // dedupe forms (by action+method+inputs)
+    sort(discovered_forms.begin(), discovered_forms.end(), [](const Form& a, const Form& b){
+        if (a.action!=b.action) return a.action < b.action;
+        if (a.method!=b.method) return a.method < b.method;
+        return a.inputs.size() < b.inputs.size();
+    });
+    discovered_forms.erase(unique(discovered_forms.begin(), discovered_forms.end(), [](const Form& a, const Form& b){
+        return a.action==b.action && a.method==b.method && a.inputs==b.inputs;
+    }), discovered_forms.end());
+
     safe_println("[*] Found " + to_string(discovered_urls.size()) + " page(s) and " + to_string(discovered_forms.size()) + " form(s) to examine.");
 
     vector<ProbeResult> findings;
     mutex findings_mtx;
     atomic<int> idx(0);
 
-    // Combine both GET parameter testing on discovered_urls and POST form testing on discovered_forms
-    // We'll create a worker that iterates both lists deterministically: first pages, then forms
     vector<string> pages = discovered_urls; // copy
     vector<Form> forms = discovered_forms; // copy
+
     auto worker_fn = [&](){
-        // process pages
         while (true) {
             int i = idx.fetch_add(1);
             if (i < (int)pages.size()) {
@@ -522,6 +609,7 @@ int main(int argc, char** argv) {
                 for (auto &kv : params) {
                     string param = kv.first;
                     ProbeResult pr = test_parameter_get(url, param, base_body, base_code, base_len, cookiefile);
+                    // clearer detection: consider any non-default note or payload as relevant
                     if (!(pr.payload.empty() && pr.note.find("No suspicious")!=string::npos)) {
                         lock_guard<mutex> g(findings_mtx);
                         findings.push_back(pr);
@@ -529,16 +617,13 @@ int main(int argc, char** argv) {
                 }
                 continue;
             }
-            // pages finished; process forms - compute index by offset
             int form_index = i - (int)pages.size();
             if (form_index >= (int)forms.size()) break;
             Form f = forms[form_index];
             for (auto &kv : f.inputs) {
                 string param = kv.first;
-                // only test POST forms for POST method; if method is GET we can build URL with params
                 if (f.method.empty()) f.method = "GET";
                 if (f.method == "GET" || f.method == "get") {
-                    // build a URL with query string from inputs
                     string constructed = f.action;
                     string qs;
                     for (auto &ip : f.inputs) {
@@ -567,6 +652,7 @@ int main(int argc, char** argv) {
     vector<thread> workers;
     for (int t=0;t<threads_n;++t) workers.emplace_back(worker_fn);
     for (auto &th : workers) if (th.joinable()) th.join();
+
     // Report
     safe_println("\n=== Scan report ===");
     if (findings.empty()) {
@@ -586,10 +672,13 @@ int main(int argc, char** argv) {
     } else {
         safe_println("\n[+] Finished (safe mode). To enable more intrusive tests, re-run with --aggressive (ONLY on systems you own).");
     }
-    // cleanup cookie file
+
+    // cleanup cookie file (optional)
     try {
-        // keep cookie file for session debugging; comment out the remove if you want to preserve it
-        // filesystem::remove(cookiefile);
+        // remove cookiefile for cleanliness
+        if (!cookiefile.empty()) {
+            filesystem::remove(cookiefile);
+        }
     } catch(...) {}
     curl_global_cleanup();
     return 0;
