@@ -16,12 +16,10 @@
 #include <chrono>
 using namespace std;
 namespace fs = std::filesystem;
-
 struct PatternGroup {
     string name;
     vector<regex> patterns; // precompiled regexes
 };
-
 // Extended patterns for assembly vulnerabilities
 vector<PatternGroup> get_asm_vuln_patterns() {
     return {
@@ -108,7 +106,7 @@ vector<PatternGroup> get_asm_vuln_patterns() {
             regex(R"(\bdebug\b)", regex_constants::icase),
             regex(R"(\bprintk\b)", regex_constants::icase)
         }},
-        {"Arithmetic / Overflow Risks", {
+        {"Arithmetic / Overflcow Risks", {
             regex(R"(\badd\b)", regex_constants::icase),
             regex(R"(\bsub\b)", regex_constants::icase),
             regex(R"(\bmul\b)", regex_constants::icase),
@@ -119,7 +117,6 @@ vector<PatternGroup> get_asm_vuln_patterns() {
         }}
     };
 };
-
 // Execute objdump (disassemble) on a binary
 // returns disassembly output or throws runtime_error on failure
 string exec_objdump(const string& binary_path, bool verbose) {
@@ -157,8 +154,6 @@ string exec_objdump(const string& binary_path, bool verbose) {
         throw runtime_error("objdump produced no output (binary may be invalid or objdump failed).");
     }
     return result;
-};
-
 // Scan asm text with pattern groups (parallelized but with limited concurrency)
 vector<string> scan_asm_text(const string& asm_text, const vector<PatternGroup>& pattern_groups,
                              const string& source_name = "asm_text", size_t max_workers = 0,
@@ -167,7 +162,6 @@ vector<string> scan_asm_text(const string& asm_text, const vector<PatternGroup>&
     set<string> seen_issues;
     mutex seen_mutex;
     mutex results_mutex;
-
     // Determine max_workers if not provided
     if (max_workers == 0) {
         unsigned int hc = thread::hardware_concurrency();
@@ -176,14 +170,11 @@ vector<string> scan_asm_text(const string& asm_text, const vector<PatternGroup>&
     if (verbose) {
         cerr << "[DEBUG] Using up to " << max_workers << " worker(s) for scanning.\n";
     }
-
     istringstream iss(asm_text);
     string line;
     int line_number = 0;
-
     vector<future<vector<string>>> active_futures;
     active_futures.reserve(max_workers * 2);
-
     auto launch_task = [&](string line_copy, int ln) -> future<vector<string>> {
         return async(launch::async, [line_copy, ln, &pattern_groups, &seen_issues, &seen_mutex, &source_name]() -> vector<string> {
             vector<string> local_results;
@@ -212,7 +203,6 @@ vector<string> scan_asm_text(const string& asm_text, const vector<PatternGroup>&
             return local_results;
         });
     };
-
     while (getline(iss, line)) {
         ++line_number;
         // Prepare to launch a task for this line
@@ -234,7 +224,6 @@ vector<string> scan_asm_text(const string& asm_text, const vector<PatternGroup>&
         // Launch a new task
         active_futures.push_back(launch_task(line, line_number));
     }
-
     // Collect remaining futures
     for (auto& f : active_futures) {
         try {
@@ -247,10 +236,8 @@ vector<string> scan_asm_text(const string& asm_text, const vector<PatternGroup>&
             // swallow exceptions to allow program to continue
         }
     }
-
     return results;
 };
-
 int main(int argc, char** argv) {
     if (argc < 3) {
         cerr << "Usage:\n"
@@ -258,7 +245,6 @@ int main(int argc, char** argv) {
              << "  asm_scanner --bin <binary_file_path> [--verbose] [--log <log_file>]\n";
         return 1;
     }
-
     // Basic arg parsing: first non-flag is mode, second is path.
     // Recognized optional flags: --verbose, --log <file>
     string mode;
@@ -272,7 +258,6 @@ int main(int argc, char** argv) {
     // Accept mode as first token (expected)
     mode = args.size() > 0 ? args[0] : "";
     if (args.size() > 1) path = args[1];
-
     // parse remaining flags (if any)
     for (size_t i = 2; i < args.size(); ++i) {
         if (args[i] == "--verbose") {
@@ -297,15 +282,12 @@ int main(int argc, char** argv) {
             }
         }
     }
-
     if (mode.empty() || path.empty()) {
         cerr << "Error: mode and path required.\n";
         return 1;
     }
-
     vector<PatternGroup> patterns = get_asm_vuln_patterns();
     vector<string> issues;
-
     // Prepare log file if requested
     ofstream log_ofs;
     bool log_enabled = false;
@@ -317,7 +299,6 @@ int main(int argc, char** argv) {
         }
         log_enabled = true;
     }
-
     try {
         if (mode == "--asm") {
             ifstream file(path);
@@ -352,7 +333,6 @@ int main(int argc, char** argv) {
             cerr << "Use --asm or --bin\n";
             return 1;
         }
-
         if (issues.empty()) {
             cout << " No potential vulnerabilities found.\n";
             if (log_enabled) log_ofs << " No potential vulnerabilities found.\n";
@@ -370,5 +350,4 @@ int main(int argc, char** argv) {
         return 1;
     };
     return 0;
-}
-
+};
