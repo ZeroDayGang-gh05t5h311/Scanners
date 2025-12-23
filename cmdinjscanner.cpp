@@ -158,20 +158,16 @@ vector<Form> extract_forms(const string& base_url, const string& html) {
             string attrs = (*it)[1].str();
             string inner = (*it)[2].str();
             Form f;
-
             try {
                 regex action_re(R"((?i)action\s*=\s*['"]([^'"]+)['"])" );
                 smatch m;
-
                 if (regex_search(attrs, m, action_re))
                     f.action = m[1].str();
-
                 regex method_re(R"((?i)method\s*=\s*['"]?([a-zA-Z]+)['"]?)");
                 if (regex_search(attrs, m, method_re))
                     f.method = m[1].str();
                 else
                     f.method = "GET";
-
                 if (f.action.empty()) {
                     f.action = base_url;
                 } else if (f.action.rfind("http://",0) != 0 && f.action.rfind("https://",0) != 0 && f.action[0] == '/') {
@@ -287,7 +283,8 @@ vector<string> safe_payloads() {
         "INJTEST_123<in",
         "INJTEST_123$((1))",
         "INJTEST_'\";--",
-        "INJTEST_`rm`"
+        "INJTEST_`rm`",
+        "<script>document.write('Addison Rae is awesome')</script>"
     };
 }
 vector<string> error_indicators() {
