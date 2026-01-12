@@ -153,7 +153,7 @@ def scan_asm_text(asm_text, pattern_groups, source_name, max_workers, verbose=Fa
             if hits:
                 results.extend(hits)
     return results
-def main():
+def cves_asm():
     parser = argparse.ArgumentParser(description="Assembly Vulnerability Scanner")
     parser.add_argument("--asm", help="Path to assembly file")
     parser.add_argument("--bin", help="Path to binary file")
@@ -210,4 +210,4 @@ def main():
             log_file.close()
     return 0
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cves_asm())
