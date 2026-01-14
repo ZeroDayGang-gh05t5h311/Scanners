@@ -595,4 +595,4 @@ def cves(argvmode,dir):
         out_path = Path(f"{args.output}.{args.format}")
         save_results(issues, out_path, args.format)
 if __name__ == "__main__":
-    cves()
+    cves(False,"")
