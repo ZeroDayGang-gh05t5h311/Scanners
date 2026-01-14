@@ -567,12 +567,15 @@ def parse_args():
 # -------------------------
 # Main
 # -------------------------
-def main():
-    args = parse_args()
-    root = Path(args.directory)
-    if not root.exists() or not root.is_dir():
-        print(f"[!] Directory not found: {root}", file=sys.stderr)
-        return
+def cves(argvmode,dir):
+    if argvmode:
+        args = parse_args()
+        root = Path(args.directory)
+        if not root.exists() or not root.is_dir():
+            print(f"[!] Directory not found: {root}", file=sys.stderr)
+            del dir; return
+    else:
+        root = dir
     custom = {}
     if args.config:
         custom = load_custom_patterns(Path(args.config))
@@ -592,4 +595,4 @@ def main():
         out_path = Path(f"{args.output}.{args.format}")
         save_results(issues, out_path, args.format)
 if __name__ == "__main__":
-    main()
+    cves()
