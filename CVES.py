@@ -1,18 +1,4 @@
 #!/usr/bin/python3
-"""
-Improved static scanner for potential vulnerabilities.
-Features:
-- Language-specific pattern sets (large lists included).
-- Compiles regexes once, applies per-file based on extension.
-- Scans whole files (not only line-by-line) and maps matches to line numbers.
-- Deduplicates results robustly (file, line, pattern, match excerpt).
-- Structured JSON/CSV output.
-- Skips binary/very large files by default.
-- Skips matches inside comments and string literals using lightweight tokenizers per language.
-- Threaded scanning and ignore-dir support.
-Usage:
-    python improved_scanner.py /path/to/repo --format json --output report --threads 12
-"""
 from __future__ import annotations
 import argparse
 import concurrent.futures
@@ -25,9 +11,6 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple
 import bisect
 import string
-# -------------------------
-# File extension -> language
-# -------------------------
 LANG_EXTENSIONS = {
     '.py': 'python',
     '.js': 'javascript',
@@ -40,11 +23,6 @@ LANG_EXTENSIONS = {
     '.sh': 'shell',
     '.bash': 'shell',
 }
-# -------------------------
-# Full pattern lists
-# (Copied from user's original lists)
-# -------------------------
-# SQL Injection Patterns
 SQL_INJECTION_PATTERNS = [
     r"(?i)select\s+\*\s+from\s+\w+",
     r"(?i)insert\s+into\s+\w+\s+\(.*\)\s+values\s+\(.*\)",
@@ -66,7 +44,6 @@ SQL_INJECTION_PATTERNS = [
     r"(?i)UNION\s+ALL\s+SELECT",
     r"(?i)CAST\(.+AS\s+VARCHAR",
 ]
-# Cross-Site Scripting (XSS) Patterns
 XSS_PATTERNS = [
     r'(?i)document\.write\s*\(',
     r'(?i)eval\((.*)\)\s*;',
@@ -87,7 +64,6 @@ XSS_PATTERNS = [
     r"(?i)location\.replace\s*\(",
     r"(?i)res\.end\s*\(",
 ]
-# Command Injection Patterns
 COMMAND_INJECTION_PATTERNS = [
     r"(?i)system\s*\(",
     r"(?i)popen\s*\(",
@@ -108,7 +84,6 @@ COMMAND_INJECTION_PATTERNS = [
     r"(?i)popen2|popen3",
     r"(?i)subprocess\.(call|check_output)\s*\(.*\+",
 ]
-# Path Traversal Patterns
 PATH_TRAVERSAL_PATTERNS = [
     r"\.\./",
     r"(\.\./){2,}",
@@ -126,7 +101,6 @@ PATH_TRAVERSAL_PATTERNS = [
     r"(?i)filename\s*=\s*request\.",
     r"(?i)Content-Disposition:\s*filename=",
 ]
-# Insecure Deserialization Patterns
 INSECURE_DESERIALIZATION_PATTERNS = [
     r"(?i)pickle\.load\s*\(",
     r"(?i)unserialize\s*\(",
@@ -150,7 +124,6 @@ INSECURE_DESERIALIZATION_PATTERNS = [
     r"(?i)XStream\.fromXML\s*\(",
     r"(?i)Gson\.fromJson\s*\(",
 ]
-# Buffer Overflow Patterns
 BUFFER_OVERFLOW_PATTERNS = [
     r"(?i)strcpy\s*\(\s*\w+,\s*\w+\)",
     r"(?i)strcat\s*\(\s*\w+,\s*\w+\)",
@@ -177,7 +150,6 @@ BUFFER_OVERFLOW_PATTERNS = [
     r"(?i)stack_exec|mprotect\s*\(",
     r"(?i)memset\(.+0x00",
 ]
-# Cross-Site Request Forgery (CSRF) Patterns
 CSRF_PATTERNS = [
     r"(?i)document\.location\.href\s*=\s*['\"]\S+['\"]",
     r"(?i)form\s+action\s*=\s*['\"]\S+['\"]",
@@ -191,7 +163,6 @@ CSRF_PATTERNS = [
     r"(?i)action\s*=\s*\"/external",
     r"(?i)autofill",
 ]
-# Improper Authentication Patterns
 IMPROPER_AUTHENTICATION_PATTERNS = [
     r"(?i)session_id\s*=\s*['\"][a-zA-Z0-9]{32}['\"]",
     r"(?i)request\.cookies\s*\['session_id'\]",
@@ -209,7 +180,6 @@ IMPROPER_AUTHENTICATION_PATTERNS = [
     r"(?i)token_expiry|exp\s*:",
     r"(?i)Authorization\s*:\s*Bearer",
 ]
-# Insecure API Patterns
 INSECURE_API_PATTERNS = [
     r"(?i)/api/v[0-9]+/users",
     r"(?i)/api/v[0-9]+/admin",
@@ -224,7 +194,6 @@ INSECURE_API_PATTERNS = [
     r"(?i)rate_limit|throttle",
     r"(?i)Authorization\s*:\s*Bearer # token leakage in logs/header",
 ]
-# Insecure Cryptographic Practices Patterns
 INSECURE_CRYPTOGRAPHIC_PATTERNS = [
     r"(?i)MD5\s*\(",
     r"(?i)SHA1\s*\(",
@@ -243,7 +212,6 @@ INSECURE_CRYPTOGRAPHIC_PATTERNS = [
     r"(?i)HMAC-SHA1",
     r"(?i)cryptography\.hazmat|from\s+Crypto\.",
 ]
-# Race Condition Patterns
 RACE_CONDITION_PATTERNS = [
     r"(?i)pthread_mutex_lock\s*\(",
     r"(?i)pthread_mutex_unlock\s*\(",
@@ -259,7 +227,6 @@ RACE_CONDITION_PATTERNS = [
     r"(?i)atomic_compare_exchange",
     r"(?i)nsync|pthread_create",
 ]
-# Privilege Escalation Patterns
 PRIVILEGE_ESCALATION_PATTERNS = [
     r"(?i)sudo\s+",
     r"(?i)chmod\s+777\s+",
@@ -274,7 +241,6 @@ PRIVILEGE_ESCALATION_PATTERNS = [
     r"(?i)iptables\s+",
     r"(?i)chroot\s*\(",
 ]
-# LANGUAGE -> patterns
 LANGUAGE_PATTERNS = {
     'python': SQL_INJECTION_PATTERNS + XSS_PATTERNS + COMMAND_INJECTION_PATTERNS + INSECURE_CRYPTOGRAPHIC_PATTERNS,
     'javascript': XSS_PATTERNS + COMMAND_INJECTION_PATTERNS + INSECURE_API_PATTERNS,
@@ -283,13 +249,7 @@ LANGUAGE_PATTERNS = {
     'java': SQL_INJECTION_PATTERNS + INSECURE_DESERIALIZATION_PATTERNS + IMPROPER_AUTHENTICATION_PATTERNS,
     'shell': COMMAND_INJECTION_PATTERNS + PRIVILEGE_ESCALATION_PATTERNS,
 }
-# -------------------------
-# Defaults
-# -------------------------
 DEFAULT_IGNORED_DIRS = {'.git', 'node_modules', '__pycache__', 'venv', '.venv', '.idea', '.gradle'}
-# -------------------------
-# Utilities
-# -------------------------
 def load_custom_patterns(config_file: Path) -> Dict[str, List[str]]:
     """Load custom patterns JSON. Expect format: { "python": ["pattern1", ...], "all": [...] }"""
     try:
@@ -301,7 +261,6 @@ def load_custom_patterns(config_file: Path) -> Dict[str, List[str]]:
     except Exception as e:
         print(f"[!] Error loading custom patterns: {e}", file=sys.stderr)
         return {}
-
 def is_text_file(path: Path, max_bytes: int = 2048, printable_threshold: float = 0.75) -> bool:
     """
     Rudimentary text file detection: read small chunk and check for null bytes and printable ratio.
@@ -330,12 +289,8 @@ def compile_patterns(pattern_list: List[str]) -> List[re.Pattern]:
         except re.error:
             compiled.append(re.compile(re.escape(p), re.IGNORECASE | re.MULTILINE))
     return compiled
-# -------------------------
-# Tokenizers: remove/blank comments & strings while preserving offsets
-# -------------------------
 # Approach: find all comment/string spans, then blank them (replace chars by spaces except keep newlines)
 # so offsets of remaining content line up with original text for accurate line mapping.
-
 def blank_span(text: str, start: int, end: int) -> None:
     """Helper to blank a slice in a bytearray-like list preserving newlines."""
     # This is implemented inside tokenizer where we operate on a list of characters
@@ -400,9 +355,6 @@ def remove_comments_and_strings_preserve_offsets(text: str, lang: str) -> str:
             if chars[i] != '\n':
                 chars[i] = ' '
     return ''.join(chars)
-# -------------------------
-# Matching and line mapping
-# -------------------------
 def find_matches_in_text(text: str, compiled_patterns: List[re.Pattern], path: Path, lang: str) -> List[Dict[str, Any]]:
     """
     Find matches while ignoring content inside comments/strings for the given language.
@@ -454,9 +406,6 @@ def find_matches_in_text(text: str, compiled_patterns: List[re.Pattern], path: P
                     "snippet": "Error mapping match to line"
                 })
     return matches
-# -------------------------
-# Per-file detection and scanning
-# -------------------------
 def detect_injections_in_file(path: Path, compiled_by_lang: Dict[str, List[re.Pattern]],
                               default_patterns: List[re.Pattern], min_size: int, max_size: int,
                               ignore_exts: List[str]) -> List[Dict[str, Any]]:
@@ -515,9 +464,6 @@ def scan_directory_for_injections(root_dir: Path, compiled_by_lang: Dict[str, Li
             seen.add(key)
             unique.append(ii)
     return unique
-# -------------------------
-# Save results
-# -------------------------
 def save_results(issues: List[Dict[str, Any]], output_file: Path, file_format: str) -> None:
     output_file = output_file.resolve()
     if file_format == "json":
@@ -530,9 +476,6 @@ def save_results(issues: List[Dict[str, Any]], output_file: Path, file_format: s
             for it in issues:
                 writer.writerow([it.get("file"), it.get("line"), it.get("pattern"), it.get("match_text"), it.get("snippet")])
     print(f"Results saved to {output_file}")
-# -------------------------
-# Build compiled sets
-# -------------------------
 def build_compiled_pattern_sets(custom_patterns: Dict[str, List[str]]) -> Tuple[Dict[str, List[re.Pattern]], List[re.Pattern]]:
     compiled_by_lang: Dict[str, List[re.Pattern]] = {}
     for lang, pats in LANGUAGE_PATTERNS.items():
@@ -549,25 +492,19 @@ def build_compiled_pattern_sets(custom_patterns: Dict[str, List[str]]) -> Tuple[
                 compiled_by_lang.setdefault(k_l, [])
                 compiled_by_lang[k_l].extend(compile_patterns([p for p in v if isinstance(p, str)]))
     return compiled_by_lang, default_patterns
-# -------------------------
-# Arg parsing
-# -------------------------
 def parse_args():
     parser = argparse.ArgumentParser(description="Improved static scanner for potential vulnerabilities.")
     parser.add_argument("directory", help="Directory to scan")
     parser.add_argument("--config", help="Custom pattern configuration file (JSON)", default=None)
     parser.add_argument("--output", help="Output file name (without extension)", default="vulnerabilities_report")
-    parser.add_argument("--format", choices=["json", "csv"], default="json")
+    parser.add_argument("--format", choices=["json", "csv"], default="csv")
     parser.add_argument("--threads", type=int, default=8, help="Number of worker threads")
     parser.add_argument("--ignore-ext", nargs="*", default=[], help="File extensions to ignore (e.g. .png .jpg)")
     parser.add_argument("--ignore-dir", nargs="*", default=[], help="Directory names to ignore (e.g. node_modules .git)")
     parser.add_argument("--min-size", type=int, default=0, help="Minimum file size in bytes to scan")
     parser.add_argument("--max-size", type=int, default=5_000_000, help="Maximum file size in bytes to scan (0 for no limit)")
     return parser.parse_args()
-# -------------------------
-# Main
-# -------------------------
-def cves():
+def main():
     args = parse_args()
     root = Path(args.directory)
     if not root.exists() or not root.is_dir():
@@ -580,11 +517,10 @@ def cves():
     # Normalize ignore lists
     ignore_exts = {ext.lower() if ext.startswith('.') else f".{ext.lower()}" for ext in args.ignore_ext}
     ignore_dirs = set([d.lower() for d in args.ignore_dir] + list(DEFAULT_IGNORED_DIRS))
-
     issues = scan_directory_for_injections(root, compiled_by_lang, default_patterns, args.threads,
                                           args.min_size, args.max_size, list(ignore_exts), list(ignore_dirs))
     if not issues:
-        print(" <| No potential vulnerabilities found.")
+        pint(" <| No potential vulnerabilities found:\n")
     else:
         print("<| Potential vulnerabilities detected:\n")
         for it in issues:
@@ -592,4 +528,4 @@ def cves():
         out_path = Path(f"{args.output}.{args.format}")
         save_results(issues, out_path, args.format)
 if __name__ == "__main__":
-    cves()
+    main()
