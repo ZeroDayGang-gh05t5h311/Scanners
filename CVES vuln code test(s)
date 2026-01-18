@@ -1,0 +1,175 @@
+"""
+This is just a dump of the code I used to test for cves.
+"""
+#include <stdio.h>
+#include <string.h>
+#include <pthread.h>
+#include <stdlib.h>
+char buffer[10];
+void vulnerable_copy(char *input) {
+    // Buffer Overflow
+    strcpy(buffer, input);  // no bounds checking
+}
+int shared_data = 0;
+pthread_mutex_t lock;
+void* increment(void *arg) {
+    // Race condition without proper locking (if lock is not used)
+    shared_data++;  
+    return NULL;
+}
+int main(int argc, char *argv[]) {
+    if (argc > 1) {
+        vulnerable_copy(argv[1]);
+    }
+    pthread_t t1, t2;
+    pthread_create(&t1, NULL, increment, NULL);
+    pthread_create(&t2, NULL, increment, NULL);
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+    printf("Shared data: %d\n", shared_data);
+    // Command Injection
+    system("ls -la"); // normally unsafe if input included directly
+    return 0;
+}
+# ^^ C
+#include <iostream>
+#include <cstring>
+#include <thread>
+#include <atomic>
+#include <cstdlib>
+char buffer[10];
+void vulnerable_copy(const char* input) {
+    // Buffer Overflow
+    strcpy(buffer, input); // unsafe
+}
+std::atomic<int> shared_counter(0);
+void increment() {
+    // Race condition avoided with atomic
+    shared_counter++;
+}
+int main(int argc, char* argv[]) {
+    if (argc > 1) {
+        vulnerable_copy(argv[1]);
+    }
+    std::thread t1(increment);
+    std::thread t2(increment);
+    t1.join();
+    t2.join();
+    std::cout << "Counter: " << shared_counter << std::endl;
+    // Command Injection
+    system("ls -la"); // unsafe if includes user input
+    return 0;
+}
+# ^^ C++
+import java.io.*;
+import java.net.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class Vulnerable {
+    // Command Injection
+    public static void runCommand(String cmd) throws IOException {
+        Runtime.getRuntime().exec(cmd);
+    }
+
+    // SSRF
+    public static void fetchUrl(String urlStr) throws IOException {
+        URL url = new URL(urlStr);  // unsafe if urlStr is untrusted
+        BufferedReader in = new BufferedReader(new InputStreamReader(url.openStream()));
+        String inputLine;
+        while((inputLine = in.readLine()) != null)
+            System.out.println(inputLine);
+        in.close();
+    }
+
+    // Race condition
+    private static int counter = 0;
+
+    public static void increment() {
+        counter++; // not thread-safe
+    }
+
+    public static void main(String[] args) throws Exception {
+        if (args.length > 0) {
+            runCommand(args[0]);
+            fetchUrl(args[0]);
+        }
+
+        Thread t1 = new Thread(() -> increment());
+        Thread t2 = new Thread(() -> increment());
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+
+        System.out.println("Counter: " + counter);
+    }
+}
+# ^^ Java
+import os
+import subprocess
+import threading
+import requests
+
+# Command Injection
+user_input = "rm -rf /"  # dangerous user input
+os.system(f"echo {user_input}")  # unsafe
+
+# SSRF
+url = input("Enter URL: ")
+response = requests.get(url)  # unsafe if url not validated
+
+# Race condition
+shared_counter = 0
+
+def increment():
+    global shared_counter
+    shared_counter += 1  # not thread-safe
+
+thread1 = threading.Thread(target=increment)
+thread2 = threading.Thread(target=increment)
+thread1.start()
+thread2.start()
+thread1.join()
+thread2.join()
+print(shared_counter)
+#^^ Java
+import os
+import subprocess
+import threading
+import requests
+
+# Command Injection
+user_input = "rm -rf /"  # dangerous user input
+os.system(f"echo {user_input}")  # unsafe
+
+# SSRF
+url = input("Enter URL: ")
+response = requests.get(url)  # unsafe if url not validated
+
+# Race condition
+shared_counter = 0
+
+def increment():
+    global shared_counter
+    shared_counter += 1  # not thread-safe
+
+thread1 = threading.Thread(target=increment)
+thread2 = threading.Thread(target=increment)
+thread1.start()
+thread2.start()
+thread1.join()
+thread2.join()
+print(shared_counter)
+# ^^ Python
+#!/bin/bash
+
+# Command Injection
+echo "Enter filename:"
+read filename
+cat $filename  # unsafe if filename contains malicious input
+
+# SSRF example (curl with user input)
+echo "Enter URL:"
+read url
+curl $url  # unsafe if url is not validated
+# ^^ Shell Script
