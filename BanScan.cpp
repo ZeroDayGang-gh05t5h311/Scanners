@@ -19,33 +19,34 @@
 #include <vector>
 #include <fstream>
 #include <condition_variable>
-#include <algorithm>  // For std::sort
+#include <algorithm>
 using namespace std::chrono;
 static const size_t BANNER_READ_BYTES = 8192;
 static std::map<int, std::string> DEFAULT_PORTS = {
-    {21,  "ftp"},
-    {22,  "ssh"},
-    {23,  "telnet"},
-    {25,  "smtp"},
-    {53,  "dns-tcp"},
-    {80,  "http"},
+    {21, "ftp"},
+    {22, "ssh"},
+    {23, "telnet"},
+    {25, "smtp"},
+    {53, "dns-tcp"},
+    {80, "http"},
     {110, "pop3"},
     {143, "imap"},
     {443, "https"},
-    {3306,"mysql"},
-    {6379,"redis"},
-    {8080,"http-alt"},
-    {8443,"https-alt"}
+    {3306, "mysql"},
+    {6379, "redis"},
+    {8080, "http-alt"},
+    {8443, "https-alt"}
 };
-class AutoSocket {f
+class AutoSocket {
 public:
     int fd = -1;
-    AutoSocket() {}
+
+    AutoSocket() = default;
     explicit AutoSocket(int f) : fd(f) {}
     ~AutoSocket() { if (fd >= 0) close(fd); }
     AutoSocket(const AutoSocket&) = delete;
     AutoSocket& operator=(const AutoSocket&) = delete;
-    AutoSocket(AutoSocket&& o) noexcept { fd = o.fd; o.fd = -1; }
+    AutoSocket(AutoSocket&& o) noexcept : fd(o.fd) { o.fd = -1; }
     AutoSocket& operator=(AutoSocket&& o) noexcept {
         if (fd >= 0) close(fd);
         fd = o.fd;
@@ -59,15 +60,15 @@ struct ScanResult {
     std::string service_guess;
     bool reachable = false;
     std::string banner;
-    std::map<std::string,std::string> extra;      // TLS info, MySQL info, etc.
-    std::map<std::string,std::string> http_headers;
+    std::map<std::string, std::string> extra;  // TLS info, MySQL info, etc.
+    std::map<std::string, std::string> http_headers;
     std::vector<std::string> notes;
     double duration_s = 0.0;
 };
 static bool set_socket_timeout(int sockfd, double seconds) {
     struct timeval tv;
-    tv.tv_sec = (int)seconds;
-    tv.tv_usec = (int)((seconds - tv.tv_sec) * 1e6);
+    tv.tv_sec = static_cast<int>(seconds);
+    tv.tv_usec = static_cast<int>((seconds - tv.tv_sec) * 1e6);
     if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
         return false;
     setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -91,31 +92,13 @@ static std::string recv_all(int sockfd, double timeout, size_t max_bytes = BANNE
     }
     return buffer;
 }
-static const unsigned char MINIMAL_TLS_CH[] = {
-    0x16,0x03,0x01,0x00,0x31, // TLS handshake record
-    0x01,0x00,0x00,0x2d,      // ClientHello
-    0x03,0x03,                // TLS 1.2
-    // Random (32 bytes)
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-    0x00,                     // sessionID length
-    0x00,0x02,                // cipher suites length
-    0x00,0x3c,                // TLS_RSA_WITH_AES_128_CBC_SHA256
-    0x01,                     // compression methods length
-    0x00                      // null compression
-};
 static void parse_tls_server_hello(const std::string& data, ScanResult& out) {
     if (data.size() < 10)
         return;
-    // Extremely superficial: detect TLS version
     if ((unsigned char)data[1] == 0x03) {
         int minor = (unsigned char)data[2];
-        out.extra["tls_version"] = std::string("TLS 1.") + std::to_string(minor - 1);
+        out.extra["tls_version"] = "TLS 1." + std::to_string(minor - 1);
     }
-    // Full certificate parsing would require ASN.1 — NOT included for safety.
-    // Instead: detect if handshake contains certificate header.
     if (data.find("CERTIFICATE") != std::string::npos)
         out.extra["tls_note"] = "Certificate blob detected (not parsed)";
 }
@@ -130,12 +113,13 @@ static void parse_mysql_hello(const std::string& b, ScanResult& out) {
         out.extra["mysql_version"] = version;
 }
 static void parse_redis(const std::string& b, ScanResult& out) {
-    if (b.size() == 0) return;
-    if (b[0] == '+') out.extra["redis_type"] = "simple-string";
-    else if (b[0] == '-') out.extra["redis_type"] = "error";
-    else if (b[0] == ':') out.extra["redis_type"] = "integer";
-    else if (b[0] == '$') out.extra["redis_type"] = "bulk-string";
-    else if (b[0] == '*') out.extra["redis_type"] = "array";
+    if (b.empty()) return;
+    char type = b[0];
+    if (type == '+') out.extra["redis_type"] = "simple-string";
+    else if (type == '-') out.extra["redis_type"] = "error";
+    else if (type == ':') out.extra["redis_type"] = "integer";
+    else if (type == '$') out.extra["redis_type"] = "bulk-string";
+    else if (type == '*') out.extra["redis_type"] = "array";
 }
 static void parse_http(const std::string& data, ScanResult& out) {
     std::istringstream ss(data);
@@ -168,7 +152,7 @@ static ScanResult probe_tcp_banner(const std::string& host, int port, double tim
     hints.ai_socktype = SOCK_STREAM;
     int gai = getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res);
     if (gai != 0) {
-        out.notes.push_back(std::string("resolve: ") + gai_strerror(gai));
+        out.notes.push_back("resolve: " + std::string(gai_strerror(gai)));
         out.duration_s = duration<double>(high_resolution_clock::now() - start).count();
         return out;
     }
@@ -189,12 +173,13 @@ static ScanResult probe_tcp_banner(const std::string& host, int port, double tim
             FD_ZERO(&wfds);
             FD_SET(sock.fd, &wfds);
             timeval tv{
-                (int)timeout,
-                (int)((timeout - (int)timeout) * 1e6)
+                static_cast<int>(timeout),
+                static_cast<int>((timeout - static_cast<int>(timeout)) * 1e6)
             };
             int sel = select(sock.fd + 1, nullptr, &wfds, nullptr, &tv);
             if (sel > 0) {
-                int soerr = 0; socklen_t sl = sizeof(soerr);
+                int soerr = 0;
+                socklen_t sl = sizeof(soerr);
                 getsockopt(sock.fd, SOL_SOCKET, SO_ERROR, &soerr, &sl);
                 if (soerr == 0) {
                     fcntl(sock.fd, F_SETFL, flags);
@@ -203,7 +188,7 @@ static ScanResult probe_tcp_banner(const std::string& host, int port, double tim
                 }
             }
         }
-        sock = AutoSocket();  // drop
+        sock = AutoSocket();  // reset socket
     }
     freeaddrinfo(res);
     if (!out.reachable) {
@@ -222,15 +207,14 @@ static ScanResult probe_tcp_banner(const std::string& host, int port, double tim
 }
 class TaskQueue {
 public:
-    std::queue<std::pair<std::string,int>> q;
+    std::queue<std::pair<std::string, int>> q;
     std::mutex m;
 
-    void push(std::pair<std::string,int> t) {
+    void push(std::pair<std::string, int> t) {
         std::lock_guard<std::mutex> lk(m);
         q.push(t);
     }
-
-    bool try_pop(std::pair<std::string,int>& o) {
+    bool try_pop(std::pair<std::string, int>& o) {
         std::lock_guard<std::mutex> lk(m);
         if (q.empty()) return false;
         o = q.front();
@@ -240,9 +224,9 @@ public:
 };
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "Usage: "<<argv[0]<<" host [--timeout 3] [--threads 8] [--json f] [--ports p1,p2,...]\n";
+        std::cerr << "Usage: " << argv[0] << " host [--timeout 3] [--threads 8] [--json f] [--ports p1,p2,...]\n";
         return 1;
-    }  
+    }
     std::string host = argv[1];
     double timeout = 3.0;
     int threads = 8;
@@ -267,7 +251,7 @@ int main(int argc, char** argv) {
     }
     // Output header
     std::cout << "[+] Banner scanner (ethical use only)\n";
-    std::cout << "[+] Host: "<<host<<"\n";
+    std::cout << "[+] Host: " << host << "\n";
     std::cout << "[+] Ports:";
     for (auto &p : DEFAULT_PORTS) std::cout << " " << p.first;
     std::cout << "\n";
@@ -277,16 +261,16 @@ int main(int argc, char** argv) {
     std::vector<ScanResult> results;
     std::mutex results_mtx;
     // Worker thread function
-    auto worker = [&]{
+    auto worker = [&] {
         while (true) {
-            std::pair<std::string,int> t;
+            std::pair<std::string, int> t;
             if (!tq.try_pop(t)) break;
             ScanResult r = probe_tcp_banner(t.first, t.second, timeout);
             std::lock_guard<std::mutex> lk(results_mtx);
             results.push_back(std::move(r));
         }
     };
-    int n = std::min(threads, (int)DEFAULT_PORTS.size());
+    int n = std::min(threads, static_cast<int>(DEFAULT_PORTS.size()));
     std::vector<std::thread> pool;
     for (int i = 0; i < n; i++) pool.emplace_back(worker);
     // Join threads
@@ -295,12 +279,10 @@ int main(int argc, char** argv) {
     std::sort(results.begin(), results.end(), [](const ScanResult& a, const ScanResult& b) {
         return a.port < b.port;
     });
-    // Display results (you can implement custom output formatting here)
+    // Display results
     for (const auto& res : results) {
         std::cout << "Host: " << res.host << " Port: " << res.port << " Service: " << res.service_guess;
-        if (res.reachable) std::cout << " [reachable]";
-        else std::cout << " [unreachable]";
-        std::cout << "\n";
+        std::cout << (res.reachable ? " [reachable]" : " [unreachable]") << "\n";
     }
     return 0;
-};
+}
