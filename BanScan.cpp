@@ -1,6 +1,3 @@
-// =====================
-// banner_scanner_improved.cpp  (FULL FIXED VERSION)
-// =====================
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -24,12 +21,7 @@
 #include <condition_variable>
 #include <algorithm>  // For std::sort
 using namespace std::chrono;
-
 static const size_t BANNER_READ_BYTES = 8192;
-
-// --------------------------
-// Improved Default Ports
-// --------------------------
 static std::map<int, std::string> DEFAULT_PORTS = {
     {21,  "ftp"},
     {22,  "ssh"},
@@ -45,11 +37,7 @@ static std::map<int, std::string> DEFAULT_PORTS = {
     {8080,"http-alt"},
     {8443,"https-alt"}
 };
-
-// --------------------------
-// Safe socket RAII wrapper
-// --------------------------
-class AutoSocket {
+class AutoSocket {f
 public:
     int fd = -1;
     AutoSocket() {}
@@ -65,28 +53,17 @@ public:
         return *this;
     }
 };
-
-// --------------------------
-// Data structure
-// --------------------------
 struct ScanResult {
     std::string host;
     int port;
     std::string service_guess;
-
     bool reachable = false;
     std::string banner;
-
     std::map<std::string,std::string> extra;      // TLS info, MySQL info, etc.
     std::map<std::string,std::string> http_headers;
-
     std::vector<std::string> notes;
     double duration_s = 0.0;
 };
-
-// --------------------------
-// Timeout helper
-// --------------------------
 static bool set_socket_timeout(int sockfd, double seconds) {
     struct timeval tv;
     tv.tv_sec = (int)seconds;
@@ -96,16 +73,11 @@ static bool set_socket_timeout(int sockfd, double seconds) {
     setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     return true;
 }
-
-// --------------------------
-// Normalized multiline read
-// --------------------------
 static std::string recv_all(int sockfd, double timeout, size_t max_bytes = BANNER_READ_BYTES) {
     set_socket_timeout(sockfd, timeout);
     std::string buffer;
     buffer.reserve(max_bytes);
     char tmp[2048];
-
     while (buffer.size() < max_bytes) {
         ssize_t n = recv(sockfd, tmp, sizeof(tmp), 0);
         if (n > 0) {
@@ -119,10 +91,6 @@ static std::string recv_all(int sockfd, double timeout, size_t max_bytes = BANNE
     }
     return buffer;
 }
-
-// -----------------------------
-// Minimal TLS ClientHello
-// -----------------------------
 static const unsigned char MINIMAL_TLS_CH[] = {
     0x16,0x03,0x01,0x00,0x31, // TLS handshake record
     0x01,0x00,0x00,0x2d,      // ClientHello
@@ -138,10 +106,6 @@ static const unsigned char MINIMAL_TLS_CH[] = {
     0x01,                     // compression methods length
     0x00                      // null compression
 };
-
-// --------------------------
-// Extract CN from simple cert parsing (very naive)
-// --------------------------
 static void parse_tls_server_hello(const std::string& data, ScanResult& out) {
     if (data.size() < 10)
         return;
@@ -155,10 +119,6 @@ static void parse_tls_server_hello(const std::string& data, ScanResult& out) {
     if (data.find("CERTIFICATE") != std::string::npos)
         out.extra["tls_note"] = "Certificate blob detected (not parsed)";
 }
-
-// --------------------------
-// MySQL greeting parser
-// --------------------------
 static void parse_mysql_hello(const std::string& b, ScanResult& out) {
     if (b.size() < 10) return;
     unsigned char protocol = b[4];
@@ -169,10 +129,6 @@ static void parse_mysql_hello(const std::string& b, ScanResult& out) {
     if (!version.empty())
         out.extra["mysql_version"] = version;
 }
-
-// --------------------------
-// Redis response parser
-// --------------------------
 static void parse_redis(const std::string& b, ScanResult& out) {
     if (b.size() == 0) return;
     if (b[0] == '+') out.extra["redis_type"] = "simple-string";
@@ -181,10 +137,6 @@ static void parse_redis(const std::string& b, ScanResult& out) {
     else if (b[0] == '$') out.extra["redis_type"] = "bulk-string";
     else if (b[0] == '*') out.extra["redis_type"] = "array";
 }
-
-// --------------------------
-// Parse HTTP
-// --------------------------
 static void parse_http(const std::string& data, ScanResult& out) {
     std::istringstream ss(data);
     std::string line;
@@ -206,18 +158,12 @@ static void parse_http(const std::string& data, ScanResult& out) {
         }
     }
 }
-
-// ------------------------
-// Core TCP probe
-// ------------------------
 static ScanResult probe_tcp_banner(const std::string& host, int port, double timeout) {
     ScanResult out;
     out.host = host;
     out.port = port;
     out.service_guess = DEFAULT_PORTS.count(port) ? DEFAULT_PORTS[port] : "tcp";
     auto start = high_resolution_clock::now();
-    
-    // Resolve
     addrinfo hints{}, *res = nullptr;
     hints.ai_socktype = SOCK_STREAM;
     int gai = getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res);
@@ -226,16 +172,12 @@ static ScanResult probe_tcp_banner(const std::string& host, int port, double tim
         out.duration_s = duration<double>(high_resolution_clock::now() - start).count();
         return out;
     }
-
-    // Connect (first viable address)
     AutoSocket sock;
     for (auto rp = res; rp; rp = rp->ai_next) {
         sock.fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (sock.fd < 0) continue;
-
         int flags = fcntl(sock.fd, F_GETFL, 0);
         fcntl(sock.fd, F_SETFL, flags | O_NONBLOCK);
-
         int c = connect(sock.fd, rp->ai_addr, rp->ai_addrlen);
         if (c == 0) {   // immediate connect
             fcntl(sock.fd, F_SETFL, flags);
@@ -264,18 +206,12 @@ static ScanResult probe_tcp_banner(const std::string& host, int port, double tim
         sock = AutoSocket();  // drop
     }
     freeaddrinfo(res);
-
     if (!out.reachable) {
         out.notes.push_back("unreachable: connect failed");
         out.duration_s = duration<double>(high_resolution_clock::now() - start).count();
         return out;
     }
-
     set_socket_timeout(sock.fd, timeout);
-
-    // ----------------------
-    // Port-specific actions
-    // ----------------------
     if (port == 80 || port == 8080) {
         std::string req = "HEAD / HTTP/1.1\r\nHost: " + host + "\r\nUser-Agent: banner-scan\r\n\r\n";
         send(sock.fd, req.c_str(), req.size(), 0);
@@ -284,10 +220,6 @@ static ScanResult probe_tcp_banner(const std::string& host, int port, double tim
     }
     return out;
 }
-
-// ----------------------------
-// TaskQueue Class
-// ----------------------------
 class TaskQueue {
 public:
     std::queue<std::pair<std::string,int>> q;
@@ -306,23 +238,16 @@ public:
         return true;
     }
 };
-
-// ----------------------------
-// Main Function
-// ----------------------------
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: "<<argv[0]<<" host [--timeout 3] [--threads 8] [--json f] [--ports p1,p2,...]\n";
         return 1;
-    }
-    
+    }  
     std::string host = argv[1];
     double timeout = 3.0;
     int threads = 8;
     std::string json_file;
     std::string ports_override;
-    
-    // Optional custom ports
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--timeout" && i + 1 < argc) timeout = std::stod(argv[++i]);
@@ -330,7 +255,6 @@ int main(int argc, char** argv) {
         else if (a == "--json" && i + 1 < argc) json_file = argv[++i];
         else if (a == "--ports" && i + 1 < argc) ports_override = argv[++i];
     }
-
     // Override default ports if specified
     if (!ports_override.empty()) {
         DEFAULT_PORTS.clear();
