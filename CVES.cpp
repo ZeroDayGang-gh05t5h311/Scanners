@@ -1,6 +1,5 @@
-// improved_scanner.cpp
-// Direct C++17 translation of the provided Python scanner (CSV-only).
-// Compile: g++ -std=c++17 -O2 -pthread -o improved_scanner improved_scanner.cpp
+//cves.cpp
+// Compile: "g++ cves.cpp -o cves -pthread
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -23,9 +22,7 @@
 #include <unordered_set>
 #include <vector>
 namespace fs = std::filesystem;
-// -------------------------
-// Simple types
-// -------------------------
+using namespace std;
 struct Issue {
     std::string file;
     int line;
@@ -33,84 +30,79 @@ struct Issue {
     std::string match_text;
     std::string snippet;
 };
-// -------------------------
 // File extension -> language
-// -------------------------
 static const std::unordered_map<std::string, std::string> LANG_EXTENSIONS = {
     {".py","python"}, {".js","javascript"}, {".c","c"}, {".cpp","cpp"}, {".cc","cpp"},
     {".h","c"}, {".hpp","cpp"}, {".java","java"}, {".sh","shell"}, {".bash","shell"}
 };
-// -------------------------
-// Full pattern lists (translated as raw string literals where appropriate)
-// -------------------------
-static const std::vector<std::string> SQL_INJECTION_PATTERNS = {
-    R"((?i)select\s+\*\s+from\s+\w+)",
-    R"((?i)insert\s+into\s+\w+\s+\(.*\)\s+values\s+\(.*\))",
-    R"((?i)update\s+\w+\s+set\s+.*\s+where\s+.*)",
-    R"((?i)drop\s+table\s+\w+)",
-    R"((?i)union\s+select\s+.*)",
-    R"((?i)and\s+1\s*=\s*1)",
-    R"((?i)or\s+1\s*=\s*1)",
-    R"((?i)select\s+from\s+information_schema.tables)",
-    R"((?i)select\s+from\s+mysql.*user)",
-    R"((?i)select\s+from\s+pg_catalog.*pg_user)",
-    R"((?i)select\s+from\s+sys\.databases)",
-    R"((?i)select\s+from\s+sqlite_master)",
-    R"((?i)execute\(\s*['\"][^'\"]*['\"]\s*\+\s*\w+)",
-    R"((?i)cursor\.execute\s*\(\s*.*\))",
-    R"((?i)prepareStatement\s*\()",
-    R"((?i)WHERE\s+1=1\s+--)",
-    R"((?i)--\s*$|#\s*$)",
-    R"((?i)UNION\s+ALL\s+SELECT)",
-    R"((?i)CAST\(.+AS\s+VARCHAR)"
+static const vector<string> SQL_INJECTION_PATTERNS = {
+    R"(\bselect\s+\*\s+from\s+\w+)",
+    R"(\binsert\s+into\s+\w+\s+\(.*\)\s+values\s+\(.*\))",
+    R"(\bupdate\s+\w+\s+set\s+.*\s+where\s+.*)",
+    R"(\bdrop\s+table\s+\w+)",
+    R"(\bunion\s+select\s+.*)",
+    R"(\band\s+1\s*=\s*1)",
+    R"(\bor\s+1\s*=\s*1)",
+    R"(\bselect\s+from\s+information_schema.tables)",
+    R"(\bselect\s+from\s+mysql.*user)",
+    R"(\bselect\s+from\s+pg_catalog.*pg_user)",
+    R"(\bselect\s+from\s+sys\.databases)",
+    R"(\bselect\s+from\s+sqlite_master)",
+    R"(\bexecute\(\s*['\"][^'\"]*['\"]\s*\+\s*\w+)",
+    R"(\bcursor\.execute\s*\(\s*.*\))",
+    R"(\bprepareStatement\s*\()",
+    R"(\bWHERE\s+1=1\s+--)",
+    R"(\b--\s*$|\b#\s*$)",
+    R"(\bUNION\s+ALL\s+SELECT)",
+    R"(\bCAST\(.+AS\s+VARCHAR)"
 };
-static const std::vector<std::string> XSS_PATTERNS = {
-    R"((?i)document\.write\s*\()",
-    R"((?i)eval\((.*)\)\s*;)",
-    R"((?i)innerHTML\s*=\s*)",
-    R"((?i)window\.location\s*=)",
-    R"((?i)location\.href\s*=)",
-    R"((?i)alert\s*\()",
-    R"((?i)confirm\s*\()",
-    R"((?i)document\.cookie)",
-    R"((?i)eval\s*\(\s*["\'].*["\']\s*\))",
-    R"((?i)response\.write\()",
-    R"((?i)res\.send\()",
-    R"((?i)innerText\s*=)",
-    R"((?i)document\.createElement\(['\"]script['\"]\))",
-    R"((?i)setAttribute\(\s*['\"]on\w+['\"]\s*,)",
-    R"((?i)dangerouslySetInnerHTML)",
-    R"((?i)style\.cssText\s*=)",
-    R"((?i)location\.replace\s*\()",
-    R"((?i)res\.end\s*\()"
+static const vector<string> XSS_PATTERNS = {
+    R"(\bdocument\.write\s*\()",
+    R"(\beval\((.*)\)\s*;)",
+    R"(\binnerHTML\s*=\s*)",
+    R"(\bwindow\.location\s*=)",
+    R"(\blocation\.href\s*=)",
+    R"(\balert\s*\()",
+    R"(\bconfirm\s*\()",
+    R"(\bdocument\.cookie)",
+    R"(\beval\s*\(\s*["\'].*["\']\s*\))",
+    R"(\bresponse\.write\()",
+    R"(\bres\.send\()",
+    R"(\binnerText\s*=)",
+    R"(\bdocument\.createElement\(['\"]script['\"]\))",
+    R"(\bsetAttribute\(\s*['\"]on\w+['\"]\s*,)",
+    R"(\bdangerouslySetInnerHTML)",
+    R"(\bstyle\.cssText\s*=)",
+    R"(\blocation\.replace\s*\()",
+    R"(\bres\.end\s*\()"
 };
-static const std::vector<std::string> COMMAND_INJECTION_PATTERNS = {
-    R"((?i)system\s*\()",
-    R"((?i)popen\s*\()",
-    R"((?i)exec\s*\()",
-    R"((?i)Runtime\.getRuntime\s*\(\)\.exec\s*\()",
-    R"((?i)subprocess\.(call|Popen)\s*\()",
-    R"((?i)child_process\.exec\s*\()",
-    R"((?i)nc\s+-e\s+)",
-    R"((?i)\$\([^\)]*\))",
-    R"((?i)eval\s*\(\s*['\"]\$\([^\)]+\)['\"]\))",
-    R"((?i)shell=True)",
-    R"((?i)cmd\.exe\s*/c)",
-    R"((?i)system\([^,]+;)",
-    R"((?i)exec\([^,]+\+)",
-    R"((?i)popen\([^,]+\+)",
-    R"((?i)ProcessBuilder\s*\(.+builder\.command\()",
-    R"((?i)Runtime\.exec\(.+\+)",
-    R"((?i)popen2|popen3)",
-    R"((?i)subprocess\.(call|check_output)\s*\(.*\+)"
+const vector<string> COMMAND_INJECTION_PATTERNS = {
+    R"(\bsystem\s*\()",
+    R"(\bpopen\s*\()",
+    R"(\bexec\s*\()",
+    R"(\bRuntime\.getRuntime\s*\(\)\.exec\s*\()",
+    R"(\bsubprocess\.(call|Popen)\s*\()",
+    R"(\bchild_process\.exec\s*\()",
+    R"(\bnc\s+-e\s+)",
+    R"(\$\([^\)]*\))",
+    R"(\beval\s*\(\s*['\"]\$\([^\)]+\)['\"]\))",
+    R"(\bshell=True)",
+    R"(\bcmd\.exe\s*/c)",
+    R"(\bsystem\([^,]+;)",
+    R"(\bexec\([^,]+\+)",
+    R"(\bpopen\([^,]+\+)",
+    R"(\bProcessBuilder\s*\(.+builder\.command\()",
+    R"(\bRuntime\.exec\(.+\+)",
+    R"(\bpopen2|popen3)",
+    R"(\bsubprocess\.(call|check_output)\s*\(.*\+)"
 };
-static const std::vector<std::string> PATH_TRAVERSAL_PATTERNS = {
+const vector<string> PATH_TRAVERSAL_PATTERNS = {
     R"(\.\./)",
     R"((\.\./){2,})",
     R"((?i)(c:|/)[^:]+/)",
     R"((?i)file://)",
-    R"((?i)open\s*\(\s*\"(\.\./|/)[^\"]+\" )",
-    R"((?i)chroot\s*\(\s*\"(\.\./|/)[^\"]+\" )",
+    R"(\bopen\s*\(\s*\"(\.\./|/)[^\"]+\" )",
+    R"(\bchroot\s*\(\s*\"(\.\./|/)[^\"]+\" )",
     R"((?i)normalizePath\(|path\.normalize\()",
     R"((?i)realpath\(|os\.realpath\()",
     R"(\.\.\\)",
@@ -121,147 +113,131 @@ static const std::vector<std::string> PATH_TRAVERSAL_PATTERNS = {
     R"((?i)filename\s*=\s*request\.)",
     R"((?i)Content-Disposition:\s*filename=)"
 };
-static const std::vector<std::string> INSECURE_DESERIALIZATION_PATTERNS = {
-    R"((?i)pickle\.load\s*\()",
-    R"((?i)unserialize\s*\()",
-    R"((?i)ObjectInputStream\s*\()",
-    R"((?i)deserialize\s*\()",
-    R"((?i)json\.parse\s*\()",
-    R"((?i)XMLDecoder\s*\()",
+const vector<string> INSECURE_DESERIALIZATION_PATTERNS = {
+    R"(\bpickle\.load\s*\()",
+    R"(\bunserialize\s*\()",
+    R"(\bObjectInputStream\s*\()",
+    R"(\bdeserialize\s*\()",
+    R"(\bjson\.parse\s*\()",
+    R"(\bXMLDecoder\s*\()",
+    R"(\bXStream\.fromXML\s*\()",
+    R"(\byaml\.load\s*\()",
+    R"(\bMarshal\.load\s*\()",
+    R"(\bMarshal\.restore\s*\()",
+    R"(\beval\(.+base64_decode\()",
+    R"(\bgob\.NewDecoder\(|encoding/gob)",
+    R"(\bserde_json::from_str\()",
+    R"(\bperl\s+Storable::thaw)",
+    R"(\bapache\.commons\.collections)",
+    R"(\breadObject\(|writeReplace\()",
+    R"(\breadObject\s*\()",
+    R"(\bwriteObject\s*\()",
+    R"(\bObjectInputStream\.resolveClass)",
+    R"(\bXStream\.fromXML\s*\()",
+    R"(\bGson\.fromJson\s*\()"
+};
+const vector<string> BUFFER_OVERFLOW_PATTERNS = {
+    R"(\bstrcpy\s*\(\s*\w+,\s*\w+\))",
+    R"(\bstrcat\s*\(\s*\w+,\s*\w+\))",
+    R"(\bgets\s*\()",
+    R"(\bscanf\s*\()",
+    R"(\bmemcpy\s*\()",
+    R"(\bfgets\s*\()",
     R"((?i)XStream\.fromXML\s*\()",
     R"((?i)yaml\.load\s*\()",
     R"((?i)Marshal\.load\s*\()",
     R"((?i)Marshal\.restore\s*\()",
-    R"((?i)eval\(.+base64_decode\()",
-    R"((?i)gob\.NewDecoder\(|encoding/gob)",
-    R"((?i)serde_json::from_str\()",
-    R"((?i)perl\s+Storable::thaw)",
-    R"((?i)apache\.commons\.collections)",
-    R"((?i)readObject\(|writeReplace\()",
-    R"((?i)readObject\s*\()",
-    R"((?i)writeObject\s*\()",
-    R"((?i)ObjectInputStream\.resolveClass)",
-    R"((?i)XStream\.fromXML\s*\()",
-    R"((?i)Gson\.fromJson\s*\()"
+    R"(\beval\(.+base64_decode\()",
+    R"(\bgob\.NewDecoder\(|encoding/gob)",
+    R"(\bserde_json::from_str\()",
+    R"(\bperl\s+Storable::thaw)",
+    R"(\bapache\.commons\.collections)",
+    R"(\breadObject\(|writeReplace\()",
+    R"(\breadObject\s*\()",
+    R"(\bwriteObject\s*\()",
+    R"(\bObjectInputStream\.resolveClass)",
+    R"(\bXStream\.fromXML\s*\()",
+    R"(\bGson\.fromJson\s*\()",
+    R"(\bmalloc\s*\(|(?i)calloc\s*\()",
+    R"(\bstack_exec|mprotect\s*\()",
+    R"(\bmemset\(.+0x00)"
 };
-static const std::vector<std::string> BUFFER_OVERFLOW_PATTERNS = {
-    R"((?i)strcpy\s*\(\s*\w+,\s*\w+\))",
-    R"((?i)strcat\s*\(\s*\w+,\s*\w+\))",
-    R"((?i)gets\s*\()",
-    R"((?i)scanf\s*\()",
-    R"((?i)memcpy\s*\()",
-    R"((?i)fgets\s*\()",
-    R"((?i)XStream\.fromXML\s*\()",
-    R"((?i)yaml\.load\s*\()",
-    R"((?i)Marshal\.load\s*\()",
-    R"((?i)Marshal\.restore\s*\()",
-    R"((?i)eval\(.+base64_decode\()",
-    R"((?i)gob\.NewDecoder\(|encoding/gob)",
-    R"((?i)serde_json::from_str\()",
-    R"((?i)perl\s+Storable::thaw)",
-    R"((?i)apache\.commons\.collections)",
-    R"((?i)readObject\(|writeReplace\()",
-    R"((?i)readObject\s*\()",
-    R"((?i)writeObject\s*\()",
-    R"((?i)ObjectInputStream\.resolveClass)",
-    R"((?i)XStream\.fromXML\s*\()",
-    R"((?i)Gson\.fromJson\s*\()",
-    R"((?i)malloc\s*\(|(?i)calloc\s*\()",
-    R"((?i)stack_exec|mprotect\s*\()",
-    R"((?i)memset\(.+0x00)"
-};
-static const std::vector<std::string> CSRF_PATTERNS = {
-    R"((?i)document\.location\.href\s*=\s*['\"]\S+['\"])",
-    R"((?i)form\s+action\s*=\s*['\"]\S+['\"])",
-    R"((?i)window\.location\s*=\s*['\"]\S+['\"])",
-    R"((?i)\$\('[^']+'\)\.submit\s*\()",
-    R"((?i)post\s+method\s*=\s*['\"]\S+['\"])",
-    R"((?i)input\s+type\s*=\s*['\"]hidden['\"]\s+name\s*=\s*['\"]csrf)",
-    R"((?i)X-CSRF-Token)",
-    R"((?i)SameSite=None)",
-    R"((?i)document\.forms\[[0-9]+\]\.submit)",
-    R"((?i)action\s*=\s*\"/external)",
-    R"((?i)autofill)"
-};
-static const std::vector<std::string> IMPROPER_AUTHENTICATION_PATTERNS = {
-    R"((?i)session_id\s*=\s*['\"][a-zA-Z0-9]{32}['\"])",
-    R"((?i)request\.cookies\s*\['session_id'\])",
-    R"((?i)Authorization\s*:\s*['\"]Bearer\s+[A-Za-z0-9\-_]+['\"])",
-    R"((?i)auth_token\s*=\s*['\"][A-Za-z0-9\-_]+['\"])",
-    R"((?i)request\.headers\s*\['Authorization'\])",
-    R"((?i)password\s*=\s*['\"][^'\"]{1,}['\"])",
-    R"((?i)api_key\s*=\s*['\"][A-Za-z0-9\-_]+['\"])",
-    R"((?i)hardcoded_secret|hardcoded_key|private_key\s*=)",
-    R"((?i)Basic\s+[A-Za-z0-9=]+)",
-    R"((?i)set_cookie\(|cookie\.set\()",
-    R"((?i)session\.(start|destroy))",
-    R"((?i)bcrypt\.hashpw\(|password_hash\()",
-    R"((?i)compare_digest\(|hmac\.compare_digest\()",
-    R"((?i)token_expiry|exp\s*:)",
-    R"((?i)Authorization\s*:\s*Bearer)"
-};
-static const std::vector<std::string> INSECURE_API_PATTERNS = {
-    R"((?i)/api/v[0-9]+/users)",
-    R"((?i)/api/v[0-9]+/admin)",
-    R"((?i)/api/v[0-9]+/token)",
-    R"((?i)/api/v[0-9]+/password)",
-    R"((?i)/api/v[0-9]+/login)",
-    R"((?i)/internal/|/private/|/debug/)",
-    R"((?i)swagger.json|api-docs|/v2/api-docs)",
-    R"((?i)X-Forwarded-For)",
-    R"((?i)introspect|.well-known/openid-configuration)",
-    R"((?i)graphql)",
-    R"((?i)rate_limit|throttle)",
-    R"((?i)Authorization\s*:\s*Bearer # token leakage in logs/header)"
-};
-static const std::vector<std::string> INSECURE_CRYPTOGRAPHIC_PATTERNS = {
-    R"((?i)MD5\s*\()",
-    R"((?i)SHA1\s*\()",
-    R"((?i)base64\s*\()",
-    R"((?i)plaintext\s*=\s*['\"][a-zA-Z0-9]+['\"])",
-    R"((?i)AES-ECB|AES128-ECB|ECB_MODE)",
-    R"((?i)openssl\s+enc\s+-aes-128-cbc)",
-    R"((?i)RSA_padding\(|RSA_NO_PADDING)",
-    R"((?i)SSLv3|ssl3)",
-    R"((?i)RC4|DES|3DES|EXPORT)",
-    R"((?i)hardcoded_key|hardcoded_password|private_key.*=)",
-    R"((?i)PBKDF2|bcrypt|scrypt)",
-    R"((?i)iteration_count\s*=\s*\d{1,4})",
-    R"((?i)random\.random\(|Math\.random\()",
-    R"((?i)secure_random|SystemRandom)",
-    R"((?i)HMAC-SHA1)",
-    R"((?i)cryptography\.hazmat|from\s+Crypto\.)"
-};
-static const std::vector<std::string> RACE_CONDITION_PATTERNS = {
-    R"((?i)pthread_mutex_lock\s*\()",
-    R"((?i)pthread_mutex_unlock\s*\()",
-    R"((?i)fsync\s*\()",
-    R"((?i)wait\s*\()",
-    R"((?i)open\([^,]+,\s*O_CREAT\|O_EXCL)",
-    R"((?i)rename\()",
-    R"((?i)stat\(|lstat\()",
-    R"((?i)mktemp\s*\()",
-    R"((?i)lockf\s*\()",
-    R"((?i)sem_wait|sem_post)",
-    R"((?i)volatile\s+)",
-    R"((?i)atomic_compare_exchange)",
-    R"((?i)nsync|pthread_create)"
+const vector<string> CSRF_PATTERNS = {
+    R"(\bdocument\.location\.href\s*=\s*['\"][^\"]+['\"])",
+    R"(\bform\s+action\s*=\s*['\"][^\"]+['\"])",
+    R"(\bwindow\.location\s*=\s*['\"][^\"]+['\"])",
+    R"(\$\('[^']+'\)\.submit\s*\()",
+    R"(\bpost\s+method\s*=\s*['\"][^\"]+['\"])",
+    R"(\binput\s+type\s*=\s*['\"]hidden['\"]\s+name\s*=\s*['\"]csrf)",
+    R"(\bX-CSRF-Token)",
+    R"(\bSameSite=None)",
+    R"(\bdocument\.forms\[[0-9]+\]\.submit)",
+    R"(\baction\s*=\s*\"/external)",
+    R"(\bautofill)"
 };
 static const std::vector<std::string> PRIVILEGE_ESCALATION_PATTERNS = {
-    R"((?i)sudo\s+)",
-    R"((?i)chmod\s+777\s+)",
-    R"((?i)chown\s+)",
-    R"((?i)setuid\(|setgid\(|seteuid\(|setegid\()",
-    R"((?i)cap_set_file|cap_get_proc)",
-    R"((?i)passwd\s+)",
+    R"(\bsudo\s+)",
+    R"(\bchmod\s+777\s+)",
+    R"(\bchown\s+)",
+    R"(\bsetuid\(|setgid\(|seteuid\(|setegid\()",
+    R"(\bcap_set_file|cap_get_proc)",
+    R"(\bpasswd\s+)",
     R"((?i)/etc/shadow|/etc/passwd)",
-    R"((?i)su\s+-)",
-    R"((?i)mount\s+-o\s+)",
-    R"((?i)docker\s+run\s+--privileged)",
-    R"((?i)iptables\s+)",
-    R"((?i)chroot\s*\()"
+    R"(\bsu\s+-)",
+    R"(\bmount\s+-o\s+)",
+    R"(\bdocker\s+run\s+--privileged)",
+    R"(\biptables\s+)",
+    R"(\bchroot\s*\()"
 };
-// LANGUAGE -> patterns
+const vector<string> INSECURE_CRYPTOGRAPHIC_PATTERNS = {
+    R"(\bMD5\s*\()",
+    R"(\bSHA1\s*\()",
+    R"(\bbase64\s*\()",
+    R"(\bplaintext\s*=\s*['\"][a-zA-Z0-9]+['\"])",
+    R"(\bAES-ECB|AES128-ECB|ECB_MODE)",
+    R"(\bopenssl\s+enc\s+-aes-128-cbc)",
+    R"(\bRSA_padding\(|RSA_NO_PADDING)",
+    R"(\bSSLv3|ssl3)",
+    R"(\bRC4|DES|3DES|EXPORT)",
+    R"(\bhardcoded_key|hardcoded_password|private_key.*=)",
+    R"(\bPBKDF2|bcrypt|scrypt)",
+    R"(\biteration_count\s*=\s*\d{1,4})",
+    R"(\brandom\.random\(|Math\.random\()",
+    R"(\bsecure_random|SystemRandom)",
+    R"(\bHMAC-SHA1)",
+    R"(\bcryptography\.hazmat|from\s+Crypto\.)"
+};
+const vector<string> INSECURE_API_PATTERNS = {
+    R"(\b/api/v[0-9]+/users)",
+    R"(\b/api/v[0-9]+/admin)",
+    R"(\b/api/v[0-9]+/token)",
+    R"(\b/api/v[0-9]+/password)",
+    R"(\b/api/v[0-9]+/login)",
+    R"(\b/internal/|\b/private/|\b/debug/)",
+    R"(\bswagger.json|\bapi-docs|\b/v2/api-docs)",
+    R"(\bX-Forwarded-For)",
+    R"(\bintrospect|\.well-known/openid-configuration)",
+    R"(\bgraphql)",
+    R"(\brate_limit|\bthrottle)",
+    R"(\bAuthorization\s*:\s*Bearer\s+#\s*token\s*leakage\s*in\s*logs/header)"
+};
+const vector<string> IMPROPER_AUTHENTICATION_PATTERNS = {
+    R"(\bsession_id\s*=\s*['\"][a-zA-Z0-9]{32}['\"])",  // Match session_id with 32-character value
+    R"(\brequest\.cookies\s*\['session_id'\])",  // Cookies with session_id key
+    R"(\bAuthorization\s*:\s*['\"]Bearer\s+[A-Za-z0-9\-_]+['\"])",  // Bearer token
+    R"(\bauth_token\s*=\s*['\"][A-Za-z0-9\-_]+['\"])",  // Token authentication pattern
+    R"(\brequest\.headers\s*\['Authorization'\])",  // Authorization header in requests
+    R"(\bpassword\s*=\s*['\"][^'\"]{1,}['\"])",  // Passwords with non-empty value
+    R"(\bapi_key\s*=\s*['\"][A-Za-z0-9\-_]+['\"])",  // API key pattern
+    R"(\bhardcoded_secret|\bhardcoded_key|\bprivate_key\s*=)",  // Hardcoded secrets or keys
+    R"(\bBasic\s+[A-Za-z0-9=]+)",  // Basic authentication with base64 encoding
+    R"(\bset_cookie\(|\bcookie\.set\()",  // Set cookie function
+    R"(\bsession\.(start|destroy))",  // Session start or destroy
+    R"(\bbcrypt\.hashpw\(|\bpassword_hash\()",  // Hashing functions for passwords
+    R"(\bcompare_digest\(|\bhmac\.compare_digest\()",  // Compare digest or HMAC digest
+    R"(\btoken_expiry|\bexp\s*:)",  // Token expiration pattern
+    R"(\bAuthorization\s*:\s*Bearer)"  // Generic Bearer authorization header
+};
 static const std::unordered_map<std::string, std::vector<std::string>> LANGUAGE_PATTERNS = {
     {"python", [](){
         std::vector<std::string> v;
