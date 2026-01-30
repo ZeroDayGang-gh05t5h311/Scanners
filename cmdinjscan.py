@@ -1,685 +1,323 @@
 #!/usr/bin/python3
 """
-Legal: Only run against targets you own or have explicit written permission to test.
-Usage:
-    python safe_injection_scanner_stdlib_extended.py [--output results.csv] [--proxy http://127.0.0.1:8080]
-        [--auth-basic user:pass] [--cookies "k=v; ..."] https://example.com/page1 ...
+Legal: Only run against targets you own or have explicit written permission to test, Still just POC basically
 """
+import time, json, csv, sys, argparse, base64, threading, random, string, html, hashlib, os
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, quote, quote_plus, urljoin
+from urllib.request import Request, build_opener, HTTPCookieProcessor, HTTPRedirectHandler, ProxyHandler
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode, quote_plus, quote, quote_from_bytes
-from urllib.request import Request, urlopen, build_opener, HTTPCookieProcessor, HTTPRedirectHandler, ProxyHandler
-from urllib.error import URLError, HTTPError
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading,json,random,string,time,sys,io,argparse,csv,html,base64,traceback
-# --- Configuration ---
+from concurrent.futures import ThreadPoolExecutor
 CONCURRENCY = 8
-REQUEST_TIMEOUT = 15  # seconds for urlopen (socket timeout)
-RATE_LIMIT_DELAY = 0.15  # delay between requests per worker (politeness)
+REQUEST_TIMEOUT = 15
+RATE_LIMIT_DELAY = 0.15
+MAX_RETRIES = 2
+ERROR_THRESHOLD = 5
+SUPPORTED_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH"]
+METHOD_FAIL_LIMIT = 12
 HEADER_KEYS_TO_TEST = ["User-Agent", "Referer", "X-Forwarded-For", "X-Client-IP"]
 DEFAULT_HEADERS = {
-    "User-Agent": "SafeScannerStdLib/1.0",
+    "User-Agent": "SafeScannerStdLib/1.1",
     "Accept": "*/*",
 }
-# New globals for proxy/auth/cookie support (set via CLI)
-GLOBAL_PROXY = None            # e.g. "http://127.0.0.1:8080"
-GLOBAL_BASIC_AUTH_HEADER = None  # "Basic <base64>"
-GLOBAL_COOKIE_HEADER = None     # "k=v; k2=v2"
-# Error logging
-ERROR_LOGFILE = "scanner_errors.log"
-MAX_RETRIES = 2  # number of retries for transient errors
-_lock_print = threading.Lock()
-def safe_print(*a, **k):
-    with _lock_print:
-        print(*a, **k)
-def log_error(msg):
-    # append error details to ERROR_LOGFILE with timestamp
-    try:
-        with open(ERROR_LOGFILE, "a", encoding="utf-8") as fh:
-            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
-    except Exception:
-        pass
-def make_marker():
-    rnd = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    return f"INJ-{rnd}"
+CMD_SEPARATORS = [";", "|", "&&", "||"]
+_global_rate_sem = threading.Semaphore(CONCURRENCY)
+class Logger:
+    def __init__(self, path):
+        self.lock = threading.Lock()
+        logdir = os.path.dirname(path)
+        if logdir:
+            os.makedirs(logdir, exist_ok=True)
+        self.fh = open(path, "a", encoding="utf-8", buffering=1)
+
+    def log(self, msg):
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] {msg}"
+        with self.lock:
+            self.fh.write(line + "\n")
+            print(line, flush=True)
+
+    def close(self):
+        with self.lock:
+            self.fh.close()
+def make_marker(prefix="INJ"):
+    return f"{prefix}-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
 def percent_encode_bytes(b):
     return ''.join('%{:02X}'.format(x) for x in b)
-def enc_plain(m):
-    return m
-def enc_url_quote(m):
-    return quote(m, safe='')
-def enc_quote_plus(m):
-    return quote_plus(m)
-def enc_space_percent20(m):
-    return m.replace(" ", "%20")
-def enc_percent_prefix(m):
-    return "%25" + quote(m, safe='')
-def enc_utf7_percent(m):
-    # produce UTF-7 bytes then percent-encode each byte
-    try:
-        b = m.encode('utf-7')
-    except Exception:
-        b = m.encode('utf-8', errors='replace')
-    return percent_encode_bytes(b)
-def enc_utf16le_percent(m):
-    try:
-        b = m.encode('utf-16le')
-    except Exception:
-        b = m.encode('utf-8', errors='replace')
-    return percent_encode_bytes(b)
-def enc_utf16be_percent(m):
-    try:
-        b = m.encode('utf-16be')
-    except Exception:
-        b = m.encode('utf-8', errors='replace')
-    return percent_encode_bytes(b)
-def enc_html_entities(m):
-    # replace special chars with HTML entities
-    return html.escape(m)
-def enc_hex_escape(m):
-    # \xNN style hex escape for ASCII bytes (useful for some interpreters)
-    b = m.encode('utf-8', errors='replace')
-    return ''.join('\\x{:02x}'.format(x) for x in b)
-def enc_double_percent(m):
-    # percent-encode then percent-encode the percent signs (double-encoding)
-    first = quote(m, safe='')
-    return quote(first, safe='')
+def enc_plain(m): return m
+def enc_url_quote(m): return quote(m, safe='')
+def enc_quote_plus(m): return quote_plus(m)
+def enc_space_percent20(m): return m.replace(" ", "%20")
+def enc_percent_prefix(m): return "%25" + quote(m, safe='')
+def enc_utf7_percent(m): return percent_encode_bytes(m.encode("utf-7", errors="replace"))
+def enc_utf16le_percent(m): return percent_encode_bytes(m.encode("utf-16le", errors="replace"))
+def enc_utf16be_percent(m): return percent_encode_bytes(m.encode("utf-16be", errors="replace"))
+def enc_html_entities(m): return html.escape(m)
+def enc_hex_escape(m): return ''.join('\\x{:02x}'.format(x) for x in m.encode())
+def enc_double_percent(m): return quote(quote(m, safe=''), safe='')
 ENCODING_VARIANTS = [
-    enc_plain,
-    enc_url_quote,
-    enc_quote_plus,
-    enc_space_percent20,
-    enc_percent_prefix,
-    enc_utf7_percent,
-    enc_utf16le_percent,
-    enc_utf16be_percent,
-    enc_html_entities,
-    enc_hex_escape,
+    enc_plain, enc_url_quote, enc_quote_plus, enc_space_percent20,
+    enc_percent_prefix, enc_utf7_percent, enc_utf16le_percent,
+    enc_utf16be_percent, enc_html_entities, enc_hex_escape,
     enc_double_percent,
 ]
-# Use {m} where the marker should be inserted.
-# These do not contain time-based or destructive commands.
 TARGETED_PAYLOAD_TEMPLATES = [
-    "{m};",          # trailing command separator character
-    "{m}|",          # pipe separator
-    "{m}&&",         # logical-and separator
-    ";{m};",         # surrounded separators
-    "'{m}'",         # single-quoted
-    "\"{m}\"",       # double-quoted
-    "({m})",         # parenthesized
-    "${{ {m} }}",    # templating-like pattern
-    "{{{m}}}",       # mustache-like
-    "\\`{m}\\`",     # backticks escaped (non-executing literal)
-    "{m}%20;",       # encoded space + semicolon
-    "{m}%0A",        # newline encoded (often filtered)
-    "%0d%0a{m}",     # CRLF around the marker
-    "{m}/",          # path-separator adjacent
-    "{m}&&true",     # non-destructive append (no external commands; 'true' as text)
-    "pre{m}post",    # surrounding text
-    # Extended templates (still non-destructive):
-    "{m}%00",        # null-byte encoded (often filtered/stripped)
-    "%00{m}",        # leading null encoded
-    "../{m}",        # path-traversal contextual marker
-    "..%2F{m}",      # encoded path traversal
-    "/..\\{m}",      # mixed separators
-    "/*{m}*/",       # C-style comment wrapper
-    "-- {m}",        # SQL-line-comment style, only for detection of filtering behavior
-    "#{m}",          # shell-comment style (as text)
-    "{m}%2F%2F",     # double slash sequence encoded
-    "{m}%3B{m}",     # semicolon between markers encoded
+    "{m};", "{m}|", "{m}&&", "'{m}'", "\"{m}\"", "({m})",
+    "{m}%0A", "%0d%0a{m}", "{m}/", "{m}&&true",
+    "pre{m}post", "{m}%00", "../{m}", "/*{m}*/", "#{m}",
 ]
-# --- HTML Parsing (forms + resource URLs) ---
 class FormAndResourceParser(HTMLParser):
     def __init__(self, base_url):
         super().__init__(convert_charrefs=True)
         self.base_url = base_url
-        self.forms = []  # list of {action, method, inputs: {name: value}}
-        self._current_form = None
-        self.resource_urls = set()
+        self.forms = []
+        self._current = None
     def handle_starttag(self, tag, attrs):
-        attrsd = dict(attrs)
-        # Resources
-        if tag == "script" and "src" in attrsd:
-            self.resource_urls.add(urljoin(self.base_url, attrsd["src"]))
-        elif tag == "img" and "src" in attrsd:
-            self.resource_urls.add(urljoin(self.base_url, attrsd["src"]))
-        elif tag == "iframe" and "src" in attrsd:
-            self.resource_urls.add(urljoin(self.base_url, attrsd["src"]))
-        elif tag == "link" and "href" in attrsd:
-            self.resource_urls.add(urljoin(self.base_url, attrsd["href"]))
-        # Forms
+        attrs = dict(attrs)
+        if tag == "base" and "href" in attrs:
+            self.base_url = urljoin(self.base_url, attrs["href"])
         if tag == "form":
-            action = attrsd.get("action", "")
-            method = attrsd.get("method", "get").lower()
-            action = urljoin(self.base_url, action)
-            self._current_form = {"action": action, "method": method, "inputs": {}}
-            self.forms.append(self._current_form)
-        elif self._current_form is not None and tag in ("input", "textarea", "select"):
-            name = attrsd.get("name")
-            if not name:
-                return
-            value = attrsd.get("value", "")
-            # for select, we can't know which option; keep default empty or value
-            self._current_form["inputs"][name] = value
-# --- HTTP utilities (using urllib only) ---
-def build_opener_with_cookies_and_proxy(proxy=None):
-    # default opener that follows redirects, supports cookies and optional proxy
-    handlers = [HTTPCookieProcessor(), HTTPRedirectHandler()]
-    if proxy:
-        handlers.append(ProxyHandler({"http": proxy, "https": proxy}))
-    return build_opener(*handlers)
-def fetch_url(url, method="GET", data=None, headers=None, timeout=REQUEST_TIMEOUT):
-    """
-    Perform a request and return (final_url, status_code, headers_dict, body_text)
-    Implements retries for transient errors and richer logging.
-    Non-fatal exceptions return None and print an error.
-    """
-    last_exc = None
-    for attempt in range(0, MAX_RETRIES + 1):
-        opener = build_opener_with_cookies_and_proxy(GLOBAL_PROXY)
+            self._current = {
+                "action": urljoin(self.base_url, attrs.get("action", "")),
+                "method": attrs.get("method", "get").lower(),
+                "inputs": {}
+            }
+            self.forms.append(self._current)
+        if self._current and tag in ("input", "textarea", "select"):
+            name = attrs.get("name")
+            if name:
+                self._current["inputs"][name] = attrs.get("value", "")
+class BaselineResponse:
+    def __init__(self, final_url, status, headers, body):
+        self.final_url = final_url
+        self.status = status
+        self.header_hash = hashlib.sha256(json.dumps(dict(headers), sort_keys=True).encode()).digest()
+        self.body_hash = hashlib.sha256(body.encode("utf-8", errors="replace")).digest()
+    def differs(self, final_url, status, headers, body):
+        return (
+            status != self.status or
+            final_url != self.final_url or
+            self.header_hash != hashlib.sha256(json.dumps(dict(headers), sort_keys=True).encode()).digest() or
+            self.body_hash != hashlib.sha256(body.encode("utf-8", errors="replace")).digest()
+        )
+class HTTPClient:
+    def __init__(self, logger, proxy=None, auth=None, cookies=None):
+        self.logger = logger
+        self.auth = auth
+        self.cookies = cookies
+        handlers = [HTTPCookieProcessor(), HTTPRedirectHandler()]
+        if proxy:
+            handlers.append(ProxyHandler({"http": proxy, "https": proxy}))
+        self.opener = build_opener(*handlers)
+    def options(self, url):
+        try:
+            req = Request(url, method="OPTIONS", headers=DEFAULT_HEADERS)
+            with self.opener.open(req, timeout=REQUEST_TIMEOUT) as r:
+                allow = r.headers.get("Allow")
+                if allow:
+                    return [m.strip().upper() for m in allow.split(",")]
+        except Exception:
+            pass
+        return None
+    def fetch(self, url, method="GET", data=None, headers=None):
         hdrs = DEFAULT_HEADERS.copy()
         if headers:
             hdrs.update(headers)
-        # apply global cookie/header/auth options
-        if GLOBAL_COOKIE_HEADER:
-            hdrs["Cookie"] = GLOBAL_COOKIE_HEADER
-        if GLOBAL_BASIC_AUTH_HEADER:
-            hdrs["Authorization"] = GLOBAL_BASIC_AUTH_HEADER
-        req = Request(url, data=(urlencode_dict_to_bytes(data) if data and method.upper() == "POST" else None), headers=hdrs, method=method.upper())
-        try:
-            with opener.open(req, timeout=timeout) as resp:
-                final = resp.geturl()
-                code = resp.getcode()
-                hdict = {}
-                for k, v in resp.info().items():
-                    hdict[k] = v
-                body = resp.read()
+        if self.cookies:
+            hdrs["Cookie"] = self.cookies
+        if self.auth:
+            hdrs["Authorization"] = self.auth
+        req = Request(url, data=data, headers=hdrs, method=method)
+        with _global_rate_sem:
+            for attempt in range(MAX_RETRIES + 1):
                 try:
-                    text = body.decode("utf-8", errors="replace")
-                except Exception:
-                    try:
-                        text = body.decode("latin-1", errors="replace")
-                    except Exception:
-                        text = str(body)
-                return final, code, hdict, text
-        except HTTPError as e:
-            # HTTPError is often not transient; capture body and return
-            try:
-                body = e.read()
-                try:
-                    text = body.decode("utf-8", errors="replace")
-                except Exception:
-                    text = body.decode("latin-1", errors="replace")
-            except Exception:
-                text = ""
-            safe_print(f"[!] HTTPError for {url}: {getattr(e,'code', 'N/A')} {getattr(e,'reason', '')}")
-            # log full traceback to error log
-            tb = traceback.format_exc()
-            log_error(f"HTTPError {url} attempt {attempt}: {tb}")
-            return (e.geturl() if hasattr(e, "geturl") else url, getattr(e, "code", None), dict(e.headers if hasattr(e, "headers") else {}), text)
-        except URLError as e:
-            # URLError may be transient; retry a few times with backoff
-            last_exc = e
-            safe_print(f"[!] URLError for {url}: {getattr(e, 'reason', e)} (attempt {attempt})")
-            tb = traceback.format_exc()
-            log_error(f"URLError {url} attempt {attempt}: {tb}")
-            if attempt < MAX_RETRIES:
-                time.sleep(1 + attempt * 1.5)
-                continue
-            return None
-        except Exception as e:
-            last_exc = e
-            safe_print(f"[!] Exception fetching {url}: {e} (attempt {attempt})")
-            tb = traceback.format_exc()
-            log_error(f"Exception {url} attempt {attempt}: {tb}")
-            if attempt < MAX_RETRIES:
-                time.sleep(1 + attempt * 1.5)
-                continue
-            return None
-    # if we fell through
-    if last_exc:
-        log_error(f"Failed to fetch {url} after retries: {last_exc}")
-    return None
-def urlencode_dict_to_bytes(d):
-    try:
-        return urlencode(d).encode("utf-8")
-    except Exception:
-        items = []
-        for k, v in (d.items() if isinstance(d, dict) else []):
-            items.append(f"{quote_plus(str(k))}={quote_plus(str(v))}")
-        return "&".join(items).encode("utf-8")
-class SafeScannerStdlib:
-    def __init__(self, targets, concurrency=CONCURRENCY, output_file=None):
+                    self.logger.log(f"REQUEST {method} {url} (attempt {attempt + 1})")
+                    with self.opener.open(req, timeout=REQUEST_TIMEOUT) as r:
+                        body = r.read().decode("utf-8", errors="replace")
+                        return r.geturl(), r.getcode(), dict(r.headers), body
+                except Exception as e:
+                    self.logger.log(f"ERROR {method} {url}: {e}")
+                    if attempt == MAX_RETRIES:
+                        return None
+                    time.sleep(1 + attempt)
+class WAFDetector:
+    HEADER_HINTS = ["cf-ray", "x-sucuri", "x-waf", "x-akamai", "x-firewall"]
+    def analyze(self, baseline, final_url, status, headers, body, marker):
+        waf = {}
+        for h in headers:
+            if h.lower() in self.HEADER_HINTS:
+                waf["header"] = h
+        if status in (403, 406, 429) and marker:
+            waf["blocking_status"] = status
+        if marker and baseline.differs(final_url, status, headers, body):
+            waf["behavioral_change"] = True
+        return waf
+class Finding:
+    def __init__(self, context, tested_url, method, status, final_url, findings, waf=None):
+        self.timestamp = time.time()
+        self.context = context
+        self.tested_url = tested_url
+        self.method = method
+        self.status = status
+        self.final_url = final_url
+        self.findings = findings
+        self.waf = waf or {}
+    def to_row(self):
+        return [
+            self.timestamp, self.context, self.tested_url,
+            self.method, self.status, self.final_url,
+            json.dumps(self.findings), json.dumps(self.waf)
+        ]
+class SafeInjectionScanner:
+    def __init__(self, targets, client, logger, output=None):
         self.targets = targets
+        self.client = client
+        self.logger = logger
+        self.output = output
         self.results = []
-        self.executor = ThreadPoolExecutor(max_workers=concurrency)
-        self.rate_limit = RATE_LIMIT_DELAY
         self.lock = threading.Lock()
-        self.output_file = output_file
-    def scan_all(self):
-        futures = []
-        for t in self.targets:
-            futures.append(self.executor.submit(self.scan_target, t))
-        for f in as_completed(futures):
-            try:
-                f.result()
-            except Exception as e:
-                safe_print(f"[!] Exception in worker: {e}")
-                log_error(traceback.format_exc())
-        self.executor.shutdown(wait=True)
-        # after run, optionally save results
-        if self.output_file:
-            try:
-                self.save_results(self.output_file)
-            except Exception as e:
-                safe_print(f"[!] Failed to save results to {self.output_file}: {e}")
-                log_error(traceback.format_exc())
-    def scan_target(self, target):
-        parsed_target = urlparse(target)
-        if not parsed_target.scheme:
-            safe_print(f"[!] Invalid URL (missing scheme): {target}")
+        self.waf = WAFDetector()
+        self.method_failures = {}
+    def _method_ok(self, url, method):
+        return self.method_failures.get(url, {}).get(method, 0) < METHOD_FAIL_LIMIT
+    def _record_method_fail(self, url, method):
+        self.method_failures.setdefault(url, {})
+        self.method_failures[url][method] = self.method_failures[url].get(method, 0) + 1
+        if self.method_failures[url][method] == METHOD_FAIL_LIMIT:
+            self.logger.log(f"SKIP {method} {url} (failure limit reached)")
+    def _record(self, finding):
+        with self.lock:
+            self.results.append(finding)
+            self.logger.log(f"FINDING {finding.context} {finding.final_url} {finding.findings}")
+    def _detect(self, baseline, marker, context, url, method, res):
+        final, status, headers, body = res
+        hits = []
+        if marker in body:
+            hits.append("body_reflection")
+        for hk, hv in headers.items():
+            if marker in hv:
+                hits.append(f"header_reflection:{hk}")
+        if marker in final:
+            hits.append("final_url")
+        if hits and baseline.differs(final, status, headers, body):
+            waf = self.waf.analyze(baseline, final, status, headers, body, marker)
+            self._record(Finding(context, url, method, status, final, hits, waf))
+    def scan_target(self, url):
+        self.logger.log(f"TARGET start {url}")
+        allowed = self.client.options(url)
+        methods = [m for m in (allowed or SUPPORTED_METHODS) if m in SUPPORTED_METHODS]
+        base = self.client.fetch(url)
+        if not base:
+            self.logger.log(f"TARGET failed {url}")
             return
-        safe_print(f"[+] Scanning: {target}")
-        self._sleep_rate()
-        initial = fetch_url(target)
-        if not initial:
-            safe_print(f"[!] Failed initial fetch for {target}")
-            return
-        final_url, status, headers, body = initial
-        parser = FormAndResourceParser(final_url)
+        final, status, headers, body = base
+        baseline = BaselineResponse(final, status, headers, body)
+        parser = FormAndResourceParser(final)
         try:
             parser.feed(body)
         except Exception:
-            # log parser errors but continue
-            log_error(f"HTML parser error for {target}:\n" + traceback.format_exc())
-        forms = parser.forms
-        resources = parser.resource_urls
-
-        qparams = parse_qs(parsed_target.query, keep_blank_values=True)
-        if qparams:
-            self.test_query_params(target, parsed_target, qparams, body)
+            pass
+        parsed = urlparse(final)
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        for method in methods:
+            if not self._method_ok(url, method):
+                continue
+            try:
+                if params:
+                    self.scan_query_params(final, parsed, params, baseline)
+                    self.scan_cmd_injection(final, parsed, params, baseline)
+                self.scan_forms(parser.forms)
+                self.scan_headers(final, baseline)
+            except Exception:
+                self._record_method_fail(url, method)
+        self.logger.log(f"TARGET done {url}")
+    def scan_query_params(self, base_url, parsed, params, baseline):
+        for pname in params:
+            marker = make_marker()
+            for tpl in ["{m}"] + TARGETED_PAYLOAD_TEMPLATES:
+                raw = tpl.replace("{m}", marker)
+                for enc in ENCODING_VARIANTS:
+                    new_params = params.copy()
+                    new_params[pname] = [enc(raw)]
+                    new_url = urlunparse(parsed._replace(query=urlencode({k: v[0] for k, v in new_params.items()})))
+                    res = self.client.fetch(new_url)
+                    if res:
+                        self._detect(baseline, marker, f"query:{pname}", new_url, "GET", res)
+                    time.sleep(RATE_LIMIT_DELAY)
+    def scan_cmd_injection(self, base_url, parsed, params, baseline):
+        for pname in params:
+            for sep in CMD_SEPARATORS:
+                marker = make_marker("CMD")
+                payload = sep + marker
+                for enc in ENCODING_VARIANTS:
+                    new_qs = params.copy()
+                    new_qs[pname] = [enc(payload)]
+                    new_url = urlunparse(parsed._replace(query=urlencode({k: v[0] for k, v in new_qs.items()})))
+                    res = self.client.fetch(new_url)
+                    if res:
+                        self._detect(baseline, marker, f"cmd_query:{pname}", new_url, "GET", res)
+                    time.sleep(RATE_LIMIT_DELAY)
+    def scan_forms(self, forms):
         for form in forms:
-            self.test_form(form)
-        self.test_headers(final_url)
-        for r in resources:
-            self.test_resource_url(r)
-        safe_print(f"[+] Finished scanning: {target}")
-    def _record_finding(self, entry):
-        with self.lock:
-            self.results.append(entry)
-    def _sleep_rate(self):
-        time.sleep(self.rate_limit)
-    def test_query_params(self, original_target, parsed_url, params, original_body):
-        for pname in list(params.keys()):
-            marker = make_marker()
-            # First, baseline checks with encoding variants
-            for enc in ENCODING_VARIANTS:
-                candidate = enc(marker)
-                new_qs = {k: (v[:] if isinstance(v, list) else [v]) for k, v in params.items()}
-                new_qs[pname] = [candidate]
-                parsed = parsed_url._replace(query=urlencode({k: v[0] for k, v in new_qs.items()}))
-                new_url = urlunparse(parsed)
-                context = f"query param '{pname}' on {original_target}"
-                self._sleep_rate()
-                res = fetch_url(new_url)
-                if not res:
-                    continue
-                final, code, resp_headers, text = res
-                findings = []
-                if marker in text:
-                    findings.append(("body", "marker_reflected"))
-                for hk, hv in resp_headers.items():
-                    if marker in hv:
-                        findings.append((f"response-header:{hk}", "marker_reflected"))
-                if marker in final:
-                    findings.append(("final_url", "marker_present"))
-                if code and (code >= 500 or code == 403):
-                    findings.append(("status", str(code)))
-                if findings:
-                    entry = {
-                        "timestamp": time.time(),
-                        "context": context,
-                        "tested_url": new_url,
-                        "method": "GET",
-                        "headers_sent": {},
-                        "data_sent_keys": None,
-                        "status": code,
-                        "final_url": final,
-                        "findings": findings,
-                    }
-                    safe_print(f"[!] Candidate reflection found: {context} -> {new_url} ; findings: {findings}")
-                    self._record_finding(entry)
-            # Then targeted payload templates (marker inserted into templates, with encoding variants applied)
-            for tpl in TARGETED_PAYLOAD_TEMPLATES:
-                tpl_raw = tpl.replace("{m}", marker)
-                for enc in ENCODING_VARIANTS:
-                    candidate = enc(tpl_raw)
-                    new_qs = {k: (v[:] if isinstance(v, list) else [v]) for k, v in params.items()}
-                    new_qs[pname] = [candidate]
-                    parsed = parsed_url._replace(query=urlencode({k: v[0] for k, v in new_qs.items()}))
-                    new_url = urlunparse(parsed)
-                    context = f"targeted tpl param '{pname}' on {original_target} tpl='{tpl}'"
-                    self._sleep_rate()
-                    res = fetch_url(new_url)
-                    if not res:
-                        continue
-                    final, code, resp_headers, text = res
-                    findings = []
-                    if marker in text:
-                        findings.append(("body", "marker_reflected"))
-                    for hk, hv in resp_headers.items():
-                        if marker in hv:
-                            findings.append((f"response-header:{hk}", "marker_reflected"))
-                    if marker in final:
-                        findings.append(("final_url", "marker_present"))
-                    if code and (code >= 500 or code == 403):
-                        findings.append(("status", str(code)))
-                    if findings:
-                        entry = {
-                            "timestamp": time.time(),
-                            "context": context,
-                            "tested_url": new_url,
-                            "method": "GET",
-                            "headers_sent": {},
-                            "data_sent_keys": None,
-                            "status": code,
-                            "final_url": final,
-                            "findings": findings,
-                        }
-                        safe_print(f"[!] Candidate reflection found: {context} -> {new_url} ; findings: {findings}")
-                        self._record_finding(entry)
-    def test_form(self, form):
-        action = form.get("action")
-        method = form.get("method", "get").lower()
-        inputs = form.get("inputs", {})
-        if not inputs:
-            return
-        for field in list(inputs.keys()):
-            marker = make_marker()
-            # baseline encodings
-            for enc in ENCODING_VARIANTS:
-                candidate = enc(marker)
-                payload = {k: (candidate if k == field else v) for k, v in inputs.items()}
-                headers = {"Content-Type": "application/x-www-form-urlencoded"}
-                context = f"form {method.upper()} field '{field}' -> {action}"
-                self._sleep_rate()
-                if method == "get":
-                    parsed = urlparse(action)
-                    parsed = parsed._replace(query=urlencode(payload))
-                    url_with_q = urlunparse(parsed)
-                    res = fetch_url(url_with_q, method="GET")
-                    if not res:
-                        continue
-                    final, code, resp_headers, text = res
-                    findings = []
-                    if marker in text:
-                        findings.append(("body", "marker_reflected"))
-                    for hk, hv in resp_headers.items():
-                        if marker in hv:
-                            findings.append((f"response-header:{hk}", "marker_reflected"))
-                    if marker in final:
-                        findings.append(("final_url", "marker_present"))
-                    if code and (code >= 500 or code == 403):
-                        findings.append(("status", str(code)))
-                    if findings:
-                        entry = {
-                            "timestamp": time.time(),
-                            "context": context,
-                            "tested_url": url_with_q,
-                            "method": "GET",
-                            "headers_sent": headers,
-                            "data_sent_keys": list(payload.keys()),
-                            "status": code,
-                            "final_url": final,
-                            "findings": findings,
-                        }
-                        safe_print(f"[!] Candidate reflection found: {context} -> {url_with_q} ; findings: {findings}")
-                        self._record_finding(entry)
-                else:
-                    res = fetch_url(action, method="POST", data=payload, headers=headers)
-                    if not res:
-                        continue
-                    final, code, resp_headers, text = res
-                    findings = []
-                    if marker in text:
-                        findings.append(("body", "marker_reflected"))
-                    for hk, hv in resp_headers.items():
-                        if marker in hv:
-                            findings.append((f"response-header:{hk}", "marker_reflected"))
-                    if marker in final:
-                        findings.append(("final_url", "marker_present"))
-                    if code and (code >= 500 or code == 403):
-                        findings.append(("status", str(code)))
-                    if findings:
-                        entry = {
-                            "timestamp": time.time(),
-                            "context": context,
-                            "tested_url": action,
-                            "method": "POST",
-                            "headers_sent": headers,
-                            "data_sent_keys": list(payload.keys()),
-                            "status": code,
-                            "final_url": final,
-                            "findings": findings,
-                        }
-                        safe_print(f"[!] Candidate reflection found: {context} -> {action} ; findings: {findings}")
-                        self._record_finding(entry)
-            # targeted templates for forms
-            for tpl in TARGETED_PAYLOAD_TEMPLATES:
-                tpl_raw = tpl.replace("{m}", marker)
-                for enc in ENCODING_VARIANTS:
-                    candidate = enc(tpl_raw)
-                    payload = {k: (candidate if k == field else v) for k, v in inputs.items()}
-                    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-                    context = f"form {method.upper()} targeted field '{field}' tpl='{tpl}' -> {action}"
-                    self._sleep_rate()
-                    if method == "get":
-                        parsed = urlparse(action)
-                        parsed = parsed._replace(query=urlencode(payload))
-                        url_with_q = urlunparse(parsed)
-                        res = fetch_url(url_with_q, method="GET")
-                        if not res:
-                            continue
-                        final, code, resp_headers, text = res
-                        findings = []
-                        if marker in text:
-                            findings.append(("body", "marker_reflected"))
-                        for hk, hv in resp_headers.items():
-                            if marker in hv:
-                                findings.append((f"response-header:{hk}", "marker_reflected"))
-                        if marker in final:
-                            findings.append(("final_url", "marker_present"))
-                        if code and (code >= 500 or code == 403):
-                            findings.append(("status", str(code)))
-                        if findings:
-                            entry = {
-                                "timestamp": time.time(),
-                                "context": context,
-                                "tested_url": url_with_q,
-                                "method": "GET",
-                                "headers_sent": headers,
-                                "data_sent_keys": list(payload.keys()),
-                                "status": code,
-                                "final_url": final,
-                                "findings": findings,
-                            }
-                            safe_print(f"[!] Candidate reflection found: {context} -> {url_with_q} ; findings: {findings}")
-                            self._record_finding(entry)
-                    else:
-                        res = fetch_url(action, method="POST", data=payload, headers=headers)
-                        if not res:
-                            continue
-                        final, code, resp_headers, text = res
-                        findings = []
-                        if marker in text:
-                            findings.append(("body", "marker_reflected"))
-                        for hk, hv in resp_headers.items():
-                            if marker in hv:
-                                findings.append((f"response-header:{hk}", "marker_reflected"))
-                        if marker in final:
-                            findings.append(("final_url", "marker_present"))
-                        if code and (code >= 500 or code == 403):
-                            findings.append(("status", str(code)))
-                        if findings:
-                            entry = {
-                                "timestamp": time.time(),
-                                "context": context,
-                                "tested_url": action,
-                                "method": "POST",
-                                "headers_sent": headers,
-                                "data_sent_keys": list(payload.keys()),
-                                "status": code,
-                                "final_url": final,
-                                "findings": findings,
-                            }
-                            safe_print(f"[!] Candidate reflection found: {context} -> {action} ; findings: {findings}")
-                            self._record_finding(entry)
-    def test_headers(self, url):
+            benign = self.client.fetch(form["action"], method=form["method"].upper(), data=urlencode(form["inputs"]).encode())
+            if not benign:
+                continue
+            baseline = BaselineResponse(*benign)
+            for field in form["inputs"]:
+                marker = make_marker()
+                for tpl in ["{m}"] + TARGETED_PAYLOAD_TEMPLATES:
+                    raw = tpl.replace("{m}", marker)
+                    for enc in ENCODING_VARIANTS:
+                        payload = {k: enc(raw) if k == field else v for k, v in form["inputs"].items()}
+                        res = self.client.fetch(form["action"], method=form["method"].upper(), data=urlencode(payload).encode())
+                        if res:
+                            self._detect(baseline, marker, f"form:{field}", form["action"], form["method"].upper(), res)
+                        time.sleep(RATE_LIMIT_DELAY)
+    def scan_headers(self, url, baseline):
         for header in HEADER_KEYS_TO_TEST:
             marker = make_marker()
-            for enc in ENCODING_VARIANTS:
-                value = enc(marker)
-                hdrs = {header: value}
-                context = f"header '{header}'"
-                self._sleep_rate()
-                res = fetch_url(url, method="GET", headers=hdrs)
-                if not res:
-                    continue
-                final, code, resp_headers, text = res
-                findings = []
-                if marker in text:
-                    findings.append(("body", "marker_reflected"))
-                for hk, hv in resp_headers.items():
-                    if marker in hv:
-                        findings.append((f"response-header:{hk}", "marker_reflected"))
-                if marker in final:
-                    findings.append(("final_url", "marker_present"))
-                if code and (code >= 500 or code == 403):
-                    findings.append(("status", str(code)))
-                if findings:
-                    entry = {
-                        "timestamp": time.time(),
-                        "context": context,
-                        "tested_url": url,
-                        "method": "GET",
-                        "headers_sent": hdrs,
-                        "data_sent_keys": None,
-                        "status": code,
-                        "final_url": final,
-                        "findings": findings,
-                    }
-                    safe_print(f"[!] Candidate reflection found: {context} -> {url} ; findings: {findings}")
-                    self._record_finding(entry)
-            # targeted templates for headers
-            for tpl in TARGETED_PAYLOAD_TEMPLATES:
-                tpl_raw = tpl.replace("{m}", marker)
+            for tpl in ["{m}"] + TARGETED_PAYLOAD_TEMPLATES:
+                raw = tpl.replace("{m}", marker)
                 for enc in ENCODING_VARIANTS:
-                    value = enc(tpl_raw)
-                    hdrs = {header: value}
-                    context = f"header-targeted '{header}' tpl='{tpl}'"
-                    self._sleep_rate()
-                    res = fetch_url(url, method="GET", headers=hdrs)
-                    if not res:
-                        continue
-                    final, code, resp_headers, text = res
-                    findings = []
-                    if marker in text:
-                        findings.append(("body", "marker_reflected"))
-                    for hk, hv in resp_headers.items():
-                        if marker in hv:
-                            findings.append((f"response-header:{hk}", "marker_reflected"))
-                    if marker in final:
-                        findings.append(("final_url", "marker_present"))
-                    if code and (code >= 500 or code == 403):
-                        findings.append(("status", str(code)))
-                    if findings:
-                        entry = {
-                            "timestamp": time.time(),
-                            "context": context,
-                            "tested_url": url,
-                            "method": "GET",
-                            "headers_sent": hdrs,
-                            "data_sent_keys": None,
-                            "status": code,
-                            "final_url": final,
-                            "findings": findings,
-                        }
-                        safe_print(f"[!] Candidate reflection found: {context} -> {url} ; findings: {findings}")
-                        self._record_finding(entry)
-    def test_resource_url(self, resource_url):
-        parsed = urlparse(resource_url)
-        qs = parse_qs(parsed.query, keep_blank_values=True)
-        if not qs:
+                    res = self.client.fetch(url, headers={header: enc(raw)})
+                    if res:
+                        self._detect(baseline, marker, f"header:{header}", url, "GET", res)
+                    time.sleep(RATE_LIMIT_DELAY)
+    def scan_all(self):
+        with ThreadPoolExecutor(CONCURRENCY) as ex:
+            ex.map(self.scan_target, self.targets)
+    def save(self):
+        if not self.output:
             return
-        self.test_query_params(resource_url, parsed, qs, "")
-    def save_results(self, filename):
-        if filename.lower().endswith(".csv"):
-            # write CSV with columns: timestamp,context,tested_url,method,status,final_url,headers_sent,data_keys,findings
-            with open(filename, "w", newline="", encoding="utf-8") as fh:
-                writer = csv.writer(fh)
-                writer.writerow(["timestamp", "context", "tested_url", "method", "status", "final_url", "headers_sent", "data_keys", "findings"])
+        if self.output.endswith(".csv"):
+            with open(self.output, "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow(["timestamp", "context", "url", "method", "status", "final_url", "findings", "waf"])
                 for r in self.results:
-                    writer.writerow([
-                        r.get("timestamp"),
-                        r.get("context"),
-                        r.get("tested_url"),
-                        r.get("method"),
-                        r.get("status"),
-                        r.get("final_url"),
-                        json.dumps(r.get("headers_sent", {}), ensure_ascii=False),
-                        json.dumps(r.get("data_sent_keys", []), ensure_ascii=False),
-                        json.dumps(r.get("findings", []), ensure_ascii=False),
-                    ])
-            safe_print(f"[+] Results saved to CSV: {filename}")
+                    w.writerow(r.to_row())
         else:
-            # plain text output (human readable)
-            with open(filename, "w", encoding="utf-8") as fh:
-                if not self.results:
-                    fh.write("No candidate reflections found.\n")
-                else:
-                    fh.write(f"Found {len(self.results)} candidate reflection(s)\n\n")
-                    for r in self.results:
-                        fh.write("=== ENTRY ===\n")
-                        fh.write(json.dumps(r, indent=2, ensure_ascii=False))
-                        fh.write("\n\n")
-            safe_print(f"[+] Results saved to text file: {filename}")
+            with open(self.output, "w", encoding="utf-8") as fh:
+                for r in self.results:
+                    fh.write(json.dumps(r.__dict__, indent=2) + "\n")
 def main(argv):
-    global GLOBAL_PROXY, GLOBAL_BASIC_AUTH_HEADER, GLOBAL_COOKIE_HEADER
-    parser = argparse.ArgumentParser(description="Safe Reflection / Command-Injection Candidate Scanner (stdlib-only, extended)")
-    parser.add_argument("targets", nargs="+", help="Target URL(s) to scan (must include scheme: https:// or http://)")
-    parser.add_argument("--output", "-o", help="Optional output filename (.csv for CSV, otherwise plain text)", default=None)
-    parser.add_argument("--proxy", help="Optional proxy URL (e.g. http://127.0.0.1:8080) to route requests through", default=None)
-    parser.add_argument("--auth-basic", help="Optional basic auth in format user:pass (will set Authorization header)", default=None)
-    parser.add_argument("--cookies", help="Optional Cookie header string (e.g. \"k=v; k2=v2\")", default=None)
-    args = parser.parse_args(argv[1:])
-
-    # set global proxy/auth/cookie
-    if args.proxy:
-        GLOBAL_PROXY = args.proxy
-        safe_print(f"[i] Using proxy: {GLOBAL_PROXY}")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("targets", nargs="+")
+    ap.add_argument("--output")
+    ap.add_argument("--proxy")
+    ap.add_argument("--auth-basic")
+    ap.add_argument("--cookies")
+    ap.add_argument("--logfile", default=f"scan_{int(time.time())}.log")
+    args = ap.parse_args(argv[1:])
+    logger = Logger(args.logfile)
+    logger.log("Scan started")
+    auth = None
     if args.auth_basic:
-        try:
-            usr, pwd = args.auth_basic.split(":", 1)
-            token = base64.b64encode(f"{usr}:{pwd}".encode("utf-8")).decode("ascii")
-            GLOBAL_BASIC_AUTH_HEADER = "Basic " + token
-            safe_print(f"[i] Using basic auth for user: {usr}")
-        except Exception:
-            safe_print("[!] Invalid --auth-basic format; expected user:pass")
-    if args.cookies:
-        GLOBAL_COOKIE_HEADER = args.cookies
-        safe_print(f"[i] Using Cookie header: {GLOBAL_COOKIE_HEADER}")
-    targets = args.targets
-    scanner = SafeScannerStdlib(targets, output_file=args.output)
-    start = time.time()
+        u, p = args.auth_basic.split(":", 1)
+        auth = "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
+    client = HTTPClient(logger, args.proxy, auth, args.cookies)
+    scanner = SafeInjectionScanner(args.targets, client, logger, args.output)
     scanner.scan_all()
-    end = time.time()
-    print("\n=== SUMMARY ===")
-    if not scanner.results:
-        print("No candidate reflections found. (Absence of reflection does not mean absence of vulnerability.)")
-    else:
-        print(f"Found {len(scanner.results)} candidate reflection(s) in {end - start:.2f}s. Review results:")
-        print(json.dumps(scanner.results, indent=2, default=str))
-    if args.output:
-        print(f"[+] Output saved to: {args.output}")
-    safe_print(f"[i] Error log (if any) written to: {ERROR_LOGFILE}")
+    scanner.save()
+    logger.log("Scan complete")
+    logger.close()
 if __name__ == "__main__":
     main(sys.argv)
