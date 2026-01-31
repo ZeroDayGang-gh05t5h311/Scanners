@@ -1,6 +1,3 @@
-// Usage:
-//   ./banner_scanner target_host [--timeout 3.0] [--threads 8] [--json out.json]
-// Only run against systems you own or have explicit permission to test.
 #include <iostream>
 #include <vector>
 #include <string>
@@ -35,6 +32,7 @@ static const std::map<int, std::string> DEFAULT_PORTS = {
     {443, "https"}
 };
 static const size_t BANNER_READ_BYTES = 4096;
+
 struct ScanResult {
     std::string host;
     int port;
@@ -45,6 +43,7 @@ struct ScanResult {
     std::vector<std::string> notes;
     double duration_s = 0.0;
 };
+
 static bool set_socket_timeout(int sockfd, double seconds) {
     struct timeval tv;
     tv.tv_sec = static_cast<int>(seconds);
@@ -54,6 +53,7 @@ static bool set_socket_timeout(int sockfd, double seconds) {
     setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     return true;
 }
+
 static std::string recv_all(int sockfd, double timeout, size_t max_bytes = BANNER_READ_BYTES) {
     set_socket_timeout(sockfd, timeout);
     std::string buffer;
@@ -69,7 +69,7 @@ static std::string recv_all(int sockfd, double timeout, size_t max_bytes = BANNE
     }
     return buffer;
 }
-// Improved HTTP parsing (status-aware, exception-safe)
+
 static void parse_http_response(const std::string& data,
                                 std::map<std::string,std::string>& headers,
                                 std::vector<std::string>& notes)
@@ -80,7 +80,7 @@ static void parse_http_response(const std::string& data,
         return;
     if (!line.empty() && line.back() == '\r') line.pop_back();
     headers["status_line"] = line;
-    // Parse status code safely
+    
     std::istringstream sl(line);
     std::string httpver;
     int status = 0;
@@ -110,7 +110,7 @@ static void parse_http_response(const std::string& data,
         headers[key] = val;
     }
 }
-// HTTPS probe (TLS + HEAD)
+
 static void probe_https(int sockfd,
                         const std::string& host,
                         double timeout,
@@ -124,7 +124,6 @@ static void probe_https(int sockfd,
         out.notes.push_back("SSL_CTX_new failed");
         return;
     }
-    // Enable ALPN: HTTP/2 and HTTP/1.1
     const unsigned char alpn_protos[] = { 2, 'h','2', 8,'h','t','t','p','/','1','.','1' };
     SSL_CTX_set_alpn_protos(ctx, alpn_protos, sizeof(alpn_protos));
     SSL* ssl = SSL_new(ctx);
@@ -137,11 +136,10 @@ static void probe_https(int sockfd,
         return;
     }
     out.reachable = true;
-    // TLS version and cipher
     out.notes.push_back("TLS version: " + std::string(SSL_get_version(ssl)));
     const char* cipher = SSL_get_cipher(ssl);
     if (cipher) out.notes.push_back("Cipher: " + std::string(cipher));
-    // ALPN protocol negotiated
+
     const unsigned char* proto = nullptr;
     unsigned int proto_len = 0;
     SSL_get0_alpn_selected(ssl, &proto, &proto_len);
@@ -157,7 +155,7 @@ static void probe_https(int sockfd,
         OPENSSL_free(iss);
         X509_free(cert);
     }
-    // Send HEAD request
+
     std::ostringstream req;
     req << "HEAD / HTTP/1.1\r\nHost: " << host
         << "\r\nUser-Agent: banner-scanner/1.0\r\n\r\n";
@@ -171,7 +169,7 @@ static void probe_https(int sockfd,
     }
     out.banner = data;
     parse_http_response(data, out.http_headers, out.notes);
-    // Normalize Server header if present
+
     auto it = out.http_headers.find("Server");
     if (it != out.http_headers.end()) {
         std::string srv = it->second;
@@ -184,8 +182,9 @@ static void probe_https(int sockfd,
     SSL_free(ssl);
     SSL_CTX_free(ctx);
 }
+
 static ScanResult probe_tcp_banner(const std::string& host, int port, double timeout) {
-    userAgent = "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.6998.166 Safari/537.36\r\n\r\n"
+    std::string userAgent = "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.6998.166 Safari/537.36\r\n\r\n";
     ScanResult out;
     out.host = host;
     out.port = port;
@@ -214,14 +213,13 @@ static ScanResult probe_tcp_banner(const std::string& host, int port, double tim
         out.notes.push_back("connect failed");
         return out;
     }
-    // Set timeouts for recv/send
+
     set_socket_timeout(sockfd, timeout);
-    // Behavior by port
     if (port == 80 || port == 443) {
         if (port == 443) probe_https(sockfd, host, timeout, out);
         else {
             std::ostringstream req;
-            req << "HEAD / HTTP/1.1\r\nHost: " << host << "\r\nUser-Agent:" << userAgent << endl;
+            req << "HEAD / HTTP/1.1\r\nHost: " << host << "\r\nUser-Agent: " << userAgent << "\r\n";
             std::string reqs = req.str();
             ssize_t sent = send(sockfd, reqs.c_str(), (int)reqs.size(), 0);
             if (sent < 0) {
@@ -242,6 +240,7 @@ static ScanResult probe_tcp_banner(const std::string& host, int port, double tim
     out.duration_s = duration<double>(high_resolution_clock::now() - start).count();
     return out;
 }
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage:\n"
@@ -249,6 +248,7 @@ int main(int argc, char* argv[]) {
                   << " target_host [--timeout 3.0] [--threads 8] [--json out.json]\n";
         return 1;
     }
+
     std::string host = argv[1];
     double timeout = 3.0;
     size_t threads = 8;
@@ -266,14 +266,17 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
+
     std::vector<std::pair<int, std::string>> ports;
     for (const auto& p : DEFAULT_PORTS)
         ports.push_back(p);
+
     std::mutex out_mutex;
     std::vector<ScanResult> results;
     std::queue<int> work;
     for (size_t i = 0; i < ports.size(); ++i)
         work.push((int)i);
+
     auto worker = [&]() {
         while (true) {
             int idx = -1;
@@ -292,11 +295,13 @@ int main(int argc, char* argv[]) {
             }
         }
     };
+
     std::vector<std::thread> pool;
     for (size_t i = 0; i < threads; ++i)
         pool.emplace_back(worker);
     for (auto& t : pool)
         t.join();
+
     for (const auto& r : results) {
         std::cout << "[" << r.host << ":" << r.port << "] ";
         if (!r.reachable) {
@@ -311,17 +316,18 @@ int main(int argc, char* argv[]) {
             std::cout << "  - " << n << "\n";
         std::cout << "\n";
     }
+
     if (!json_out.empty()) {
-        std::ofstream jf(json_out); // Fixed missing declaration of jf
-        std::cout << "\n  \"results\": [\n"; // Fixed the incorrect cout line
+        std::ofstream jf(json_out);
+        jf << "\n  \"results\": [\n";
         for (size_t i = 0; i < results.size(); ++i) {
             const auto& r = results[i];
             jf << "    {\n";
             jf << "      \"host\": \"" << r.host << "\",\n";
             jf << "      \"port\": " << r.port << ",\n";
             jf << "      \"reachable\": " << (r.reachable ? "true" : "false") << ",\n";
-            jf << "      \"duration\": " << r.duration_s << ",\n";  // Fixed typo here
-            jf << "      \"banner\": " << std::quoted(r.banner) << ",\n";  // Fixed typo here
+            jf << "      \"duration\": " << r.duration_s << ",\n";
+            jf << "      \"banner\": \"" << r.banner << "\",\n";
             jf << "      \"headers\": {\n";
             size_t hc = 0;
             for (const auto& h : r.http_headers) {
@@ -341,10 +347,7 @@ int main(int argc, char* argv[]) {
             if (i + 1 < results.size()) jf << ",";
             jf << "\n";
         }
-        jf << "  ]\n}\n";  // Fixed closing JSON bracket
+        jf << "  ]\n}\n";
     }
 };
-/*
-banner_scanner.cpp \
-    -o banner_scanner \
-    -lssl -lcrypto -pthread */
+//g++ -w sila.cpp -o sila -lssl -lcrypto -pthread
