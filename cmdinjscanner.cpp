@@ -1,4 +1,3 @@
-// SafeInjectionScanner.cpp
 //g++ -w cmd_inj_scan_0.6.cpp $(pkg-config --cflags --libs -libs libxml-2.0) -lcurl -lssl -lcrypto -lpthread -o scanner
 //sudo apt install libcurl4-openssl-dev libssl-dev libxml2-dev
 #include <iostream>
@@ -160,7 +159,6 @@ public:
         hdr_hash=sha256(h);
         body_hash=sha256(r.body);
     }
-
     bool differs(const HttpResponse& r) const {
         if (r.status!=status||r.final_url!=url) return true;
         vector<pair<string,string>> hs(r.headers.begin(),r.headers.end());
@@ -198,15 +196,12 @@ class SafeInjectionScanner {
 public:
     SafeInjectionScanner(const vector<string>& t,HTTPClient& c,Logger& l)
         : targets(t),client(c),logger(l){}
-
     void scan_target(const string& url) {
         logger.log("TARGET start "+url);
         auto allowed = client.options(url);
         auto methods = allowed.empty()?SUPPORTED_METHODS:allowed;
-
         auto base = client.fetch(url);
         BaselineResponse baseline(base);
-
         for (auto& m: methods) {
             if (!method_ok(url,m)) continue;
             try {
@@ -251,4 +246,4 @@ int main(int argc,char* argv[]) {
     scanner.run();
     logger.log("Scan complete");
     return 0;
-}
+};
