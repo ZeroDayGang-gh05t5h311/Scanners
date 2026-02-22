@@ -1,25 +1,42 @@
 package main
 import (
+	"bufio"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 var DEFAULT_PORTS = map[int]string{
-	21:  "ftp",
-	22:  "ssh",
-	23:  "telnet",
-	25:  "smtp",
-	80:  "http",
-	443: "https",
+	21:   "ftp",
+	22:   "ssh",
+	23:   "telnet",
+	25:   "smtp",
+	53:   "dns",
+	80:   "http",
+	110:  "pop3",
+	143:  "imap",
+	443:  "https",
+	3306: "mysql",
+	6379: "redis",
+	8080: "http-alt",
+	8443: "https-alt",
 }
+
 const BANNER_READ_BYTES = 4096
+
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 4096)
+	},
+}
+
 type ScanResult struct {
 	Host         string
 	Port         int
@@ -30,20 +47,28 @@ type ScanResult struct {
 	Notes        []string
 	DurationS    float64
 }
+
 func setSocketTimeout(conn net.Conn, timeout float64) error {
 	return conn.SetDeadline(time.Now().Add(time.Duration(timeout * float64(time.Second))))
 }
+
 func recvAll(conn net.Conn, timeout float64, maxBytes int) (string, error) {
 	if err := setSocketTimeout(conn, timeout); err != nil {
 		return "", err
 	}
-	var buffer string
-	tmp := make([]byte, 2048)
-	for len(buffer) < maxBytes {
-		n, err := conn.Read(tmp)
+
+	buf := bufferPool.Get().([]byte)
+	defer bufferPool.Put(buf)
+
+	reader := bufio.NewReader(conn)
+	var builder strings.Builder
+	builder.Grow(maxBytes)
+
+	for builder.Len() < maxBytes {
+		n, err := reader.Read(buf)
 		if n > 0 {
-			buffer += string(tmp[:n])
-			if strings.Contains(buffer, "\r\n\r\n") {
+			builder.Write(buf[:n])
+			if strings.Contains(builder.String(), "\r\n\r\n") {
 				break
 			}
 		}
@@ -51,141 +76,163 @@ func recvAll(conn net.Conn, timeout float64, maxBytes int) (string, error) {
 			if err == io.EOF {
 				break
 			}
-			return buffer, err
+			return builder.String(), err
 		}
 	}
-	return buffer, nil
+
+	return builder.String(), nil
 }
+
+func detectFingerprints(data string, port int, result *ScanResult) {
+	if data == "" {
+		return
+	}
+
+	switch {
+	case strings.HasPrefix(data, "SSH-"):
+		result.Notes = append(result.Notes, "Fingerprint: SSH service detected")
+
+	case strings.HasPrefix(data, "220") && strings.Contains(data, "FTP"):
+		result.Notes = append(result.Notes, "Fingerprint: FTP service detected")
+
+	case strings.HasPrefix(data, "+OK"):
+		result.Notes = append(result.Notes, "Fingerprint: POP3 service detected")
+
+	case strings.Contains(data, "* OK"):
+		result.Notes = append(result.Notes, "Fingerprint: IMAP service detected")
+
+	case strings.HasPrefix(data, "220") && strings.Contains(data, "SMTP"):
+		result.Notes = append(result.Notes, "Fingerprint: SMTP service detected")
+
+	case strings.Contains(data, "Redis"):
+		result.Notes = append(result.Notes, "Fingerprint: Redis service detected")
+
+	case strings.Contains(data, "mysql_native_password"):
+		result.Notes = append(result.Notes, "Fingerprint: MySQL service detected")
+
+	case strings.HasPrefix(data, "HTTP/"):
+		result.Notes = append(result.Notes, "Fingerprint: HTTP service detected")
+
+	case port == 53 && len(data) > 0:
+		result.Notes = append(result.Notes, "Fingerprint: Possible DNS service")
+
+	case strings.Contains(strings.ToLower(data), "telnet"):
+		result.Notes = append(result.Notes, "Fingerprint: Telnet service detected")
+	}
+}
+
 func parseHTTPResponse(data string, headers map[string]string, notes *[]string) {
 	lines := strings.Split(data, "\r\n")
 	if len(lines) == 0 {
 		return
 	}
+
 	statusLine := lines[0]
 	headers["status_line"] = statusLine
 	parts := strings.SplitN(statusLine, " ", 3)
+
 	if len(parts) < 2 {
 		*notes = append(*notes, "Malformed HTTP status line")
 		return
 	}
+
 	headers["status_code"] = parts[1]
 	if len(parts) == 3 {
 		headers["reason"] = parts[2]
-	} else {
-		headers["reason"] = ""
 	}
+
 	if parts[1] != "200" {
 		*notes = append(*notes, "HTTP non-200 status: "+parts[1])
 	}
+
 	for _, line := range lines[1:] {
 		if line == "" {
 			break
 		}
-		pos := strings.Index(line, ":")
-		if pos < 0 {
-			continue
+		if pos := strings.Index(line, ":"); pos > 0 {
+			headers[line[:pos]] = strings.TrimSpace(line[pos+1:])
 		}
-		key := line[:pos]
-		val := strings.TrimLeft(line[pos+1:], " \t")
-		headers[key] = val
 	}
 }
+
 func probeHTTPS(conn net.Conn, host string, timeout float64, result *ScanResult) {
-	cfg := &tls.Config{
-		InsecureSkipVerify: true,
-		ServerName:         host,
+	cfg := &tls.Config{InsecureSkipVerify: true}
+	if net.ParseIP(host) == nil {
+		cfg.ServerName = host
 	}
+
 	tlsConn := tls.Client(conn, cfg)
 	_ = tlsConn.SetDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
+
 	if err := tlsConn.Handshake(); err != nil {
 		result.Notes = append(result.Notes, "TLS handshake failed")
 		return
 	}
-	result.Reachable = true
+
 	state := tlsConn.ConnectionState()
-	// TLS version
-	var ver string
-	switch state.Version {
-	case tls.VersionTLS13:
-		ver = "TLSv1.3"
-	case tls.VersionTLS12:
-		ver = "TLSv1.2"
-	case tls.VersionTLS11:
-		ver = "TLSv1.1"
-	case tls.VersionTLS10:
-		ver = "TLSv1.0"
-	default:
-		ver = fmt.Sprintf("Unknown (%d)", state.Version)
-	}
-	result.Notes = append(result.Notes, "TLS version: "+ver)
-	// Cipher
+
+	result.Notes = append(result.Notes, "TLS version detected")
 	result.Notes = append(result.Notes, "Cipher: "+tls.CipherSuiteName(state.CipherSuite))
-	// ALPN
-	if state.NegotiatedProtocol != "" {
-		result.Notes = append(result.Notes, "ALPN protocol: "+state.NegotiatedProtocol)
-	}
-	// Certificate
-	if len(state.PeerCertificates) > 0 {
-		cert := state.PeerCertificates[0]
-		result.Notes = append(result.Notes, "TLS Subject: "+cert.Subject.String())
-		result.Notes = append(result.Notes, "TLS Issuer: "+cert.Issuer.String())
-	}
+
 	req := fmt.Sprintf(
-		"HEAD / HTTP/1.1\r\nHost: %s\r\nUser-Agent: banner-scanner/1.0\r\n\r\n",
+		"HEAD / HTTP/1.1\r\nHost: %s\r\nUser-Agent: banner-scanner/1.0\r\nConnection: close\r\n\r\n",
 		host,
 	)
+
 	_, _ = tlsConn.Write([]byte(req))
 	data, _ := recvAll(tlsConn, timeout, BANNER_READ_BYTES)
+
 	result.Banner = data
 	parseHTTPResponse(data, result.HTTPHeaders, &result.Notes)
-	if srv, ok := result.HTTPHeaders["Server"]; ok {
-		norm := ""
-		if strings.Contains(srv, "Apache") {
-			norm = "Apache"
-		} else if strings.Contains(srv, "nginx") {
-			norm = "nginx"
-		} else if strings.Contains(srv, "Microsoft-IIS") {
-			norm = "IIS"
-		}
-		if norm != "" {
-			result.Notes = append(result.Notes, "Normalized server: "+norm)
-		}
-	}
+	detectFingerprints(data, result.Port, result)
 }
+
 func probeTCPBanner(host string, port int, timeout float64) ScanResult {
 	result := ScanResult{
 		Host:         host,
 		Port:         port,
 		ServiceGuess: DEFAULT_PORTS[port],
-		HTTPHeaders:  make(map[string]string),
+		HTTPHeaders:  make(map[string]string, 16),
+		Notes:        make([]string, 0, 8),
 	}
+
 	start := time.Now()
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), time.Duration(timeout)*time.Second)
+	result.DurationS = time.Since(start).Seconds()
+
 	if err != nil {
 		result.Notes = append(result.Notes, "connect failed")
 		return result
 	}
+
 	defer conn.Close()
 	result.Reachable = true
+
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+	}
+
 	_ = setSocketTimeout(conn, timeout)
-	if port == 80 || port == 443 {
-		if port == 443 {
-			probeHTTPS(conn, host, timeout, &result)
-		} else {
-			userAgent := "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.6998.166 Safari/537.36\r\n\r\n"
-			req := fmt.Sprintf("HEAD / HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s", host, userAgent)
-			if _, err := conn.Write([]byte(req)); err != nil {
-				result.Notes = append(result.Notes, "HTTP send error")
-			}
-			data, _ := recvAll(conn, timeout, BANNER_READ_BYTES)
-			result.Banner = data
-			parseHTTPResponse(data, result.HTTPHeaders, &result.Notes)
-		}
+
+	if port == 80 || port == 8080 {
+		req := fmt.Sprintf(
+			"HEAD / HTTP/1.1\r\nHost: %s\r\nUser-Agent: banner-scanner/1.0\r\nConnection: close\r\n\r\n",
+			host,
+		)
+		conn.Write([]byte(req))
+		data, _ := recvAll(conn, timeout, BANNER_READ_BYTES)
+		result.Banner = data
+		parseHTTPResponse(data, result.HTTPHeaders, &result.Notes)
+		detectFingerprints(data, port, &result)
+
+	} else if port == 443 || port == 8443 {
+		probeHTTPS(conn, host, timeout, &result)
+
 	} else {
 		data, _ := recvAll(conn, timeout, BANNER_READ_BYTES)
 		result.Banner = data
+		detectFingerprints(data, port, &result)
 	}
-	result.DurationS = time.Since(start).Seconds()
 	return result
 }
 func main() {
@@ -218,20 +265,20 @@ func main() {
 	for p := range DEFAULT_PORTS {
 		ports = append(ports, p)
 	}
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	results := []ScanResult{}
 	work := make(chan int, len(ports))
-	for i := range ports {
-		work <- i
+	for _, p := range ports {
+		work <- p
 	}
 	close(work)
+	results := make([]ScanResult, 0, len(ports))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 	wg.Add(threads)
 	for i := 0; i < threads; i++ {
 		go func() {
 			defer wg.Done()
-			for idx := range work {
-				r := probeTCPBanner(host, ports[idx], timeout)
+			for port := range work {
+				r := probeTCPBanner(host, port, timeout)
 				mu.Lock()
 				results = append(results, r)
 				mu.Unlock()
@@ -239,6 +286,9 @@ func main() {
 		}()
 	}
 	wg.Wait()
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Port < results[j].Port
+	})
 	for _, r := range results {
 		fmt.Printf("[%s:%d] ", r.Host, r.Port)
 		if !r.Reachable {
