@@ -8,7 +8,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <chrono> 
+#include <chrono>
 #include <cstring>
 #include <errno.h>
 #include <fcntl.h>
@@ -28,13 +28,14 @@ static const std::map<int, std::string> DEFAULT_PORTS = {
     {22, "ssh"},
     {23, "telnet"},
     {25, "smtp"},
+    {53, "dns"},
     {80, "http"},
     {443, "https"}
 };
 static const size_t BANNER_READ_BYTES = 4096;
 struct ScanResult {
     std::string host;
-    int port;
+    int port = 0;
     std::string service_guess;
     bool reachable = false;
     std::string banner;
@@ -44,7 +45,7 @@ struct ScanResult {
 };
 static bool set_socket_timeout(int sockfd, double seconds) {
     struct timeval tv;
-    tv.tv_sec = static_cast<int>(seconds);
+    tv.tv_sec  = static_cast<int>(seconds);
     tv.tv_usec = static_cast<int>((seconds - tv.tv_sec) * 1e6);
     if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
         return false;
@@ -59,7 +60,8 @@ static std::string recv_all(int sockfd, double timeout, size_t max_bytes = BANNE
         ssize_t n = recv(sockfd, tmp, sizeof(tmp), 0);
         if (n > 0) {
             buffer.append(tmp, n);
-            if (buffer.find("\r\n\r\n") != std::string::npos) break;
+            if (buffer.find("\r\n\r\n") != std::string::npos)
+                break;
         } else {
             break;
         }
@@ -74,9 +76,9 @@ static void parse_http_response(const std::string& data,
     std::string line;
     if (!std::getline(ss, line))
         return;
-    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (!line.empty() && line.back() == '\r')
+        line.pop_back();
     headers["status_line"] = line;
-    
     std::istringstream sl(line);
     std::string httpver;
     int status = 0;
@@ -94,15 +96,18 @@ static void parse_http_response(const std::string& data,
         return;
     }
     while (std::getline(ss, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty()) break;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.empty())
+            break;
         auto pos = line.find(':');
         if (pos == std::string::npos)
             continue;
         std::string key = line.substr(0, pos);
         std::string val = line.substr(pos + 1);
         size_t a = val.find_first_not_of(" \t");
-        if (a != std::string::npos) val = val.substr(a);
+        if (a != std::string::npos)
+            val = val.substr(a);
         headers[key] = val;
     }
 }
@@ -111,15 +116,15 @@ static void probe_https(int sockfd,
                         double timeout,
                         ScanResult& out)
 {
-    SSL_library_init();
-    SSL_load_error_strings();
-    OpenSSL_add_all_algorithms();
     SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) {
         out.notes.push_back("SSL_CTX_new failed");
         return;
     }
-    const unsigned char alpn_protos[] = { 2, 'h','2', 8,'h','t','t','p','/','1','.','1' };
+    const unsigned char alpn_protos[] = {
+        2, 'h','2',
+        8, 'h','t','t','p','/','1','.','1'
+    };
     SSL_CTX_set_alpn_protos(ctx, alpn_protos, sizeof(alpn_protos));
     SSL* ssl = SSL_new(ctx);
     SSL_set_fd(ssl, sockfd);
@@ -132,15 +137,15 @@ static void probe_https(int sockfd,
     }
     out.reachable = true;
     out.notes.push_back("TLS version: " + std::string(SSL_get_version(ssl)));
-    const char* cipher = SSL_get_cipher(ssl);
-    if (cipher) out.notes.push_back("Cipher: " + std::string(cipher));
+    if (const char* cipher = SSL_get_cipher(ssl))
+        out.notes.push_back("Cipher: " + std::string(cipher));
     const unsigned char* proto = nullptr;
     unsigned int proto_len = 0;
     SSL_get0_alpn_selected(ssl, &proto, &proto_len);
     if (proto_len > 0)
-        out.notes.push_back("ALPN protocol: " + std::string(reinterpret_cast<const char*>(proto), proto_len));
-    X509* cert = SSL_get_peer_certificate(ssl);
-    if (cert) {
+        out.notes.push_back("ALPN protocol: " +
+            std::string(reinterpret_cast<const char*>(proto), proto_len));
+    if (X509* cert = SSL_get_peer_certificate(ssl)) {
         char* subj = X509_NAME_oneline(X509_get_subject_name(cert), nullptr, 0);
         char* iss  = X509_NAME_oneline(X509_get_issuer_name(cert), nullptr, 0);
         if (subj) out.notes.push_back(std::string("TLS Subject: ") + subj);
@@ -158,7 +163,8 @@ static void probe_https(int sockfd,
     int n;
     while ((n = SSL_read(ssl, buf, sizeof(buf))) > 0) {
         data.append(buf, n);
-        if (data.find("\r\n\r\n") != std::string::npos) break;
+        if (data.find("\r\n\r\n") != std::string::npos)
+            break;
     }
     out.banner = data;
     parse_http_response(data, out.http_headers, out.notes);
@@ -175,11 +181,11 @@ static void probe_https(int sockfd,
     SSL_CTX_free(ctx);
 }
 static ScanResult probe_tcp_banner(const std::string& host, int port, double timeout) {
-    std::string userAgent = "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.6998.166 Safari/537.36\r\n\r\n";
     ScanResult out;
     out.host = host;
     out.port = port;
-    out.service_guess = DEFAULT_PORTS.at(port);
+    auto it = DEFAULT_PORTS.find(port);
+    out.service_guess = (it != DEFAULT_PORTS.end()) ? it->second : "unknown";
     auto start = high_resolution_clock::now();
     struct addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_UNSPEC;
@@ -189,13 +195,16 @@ static ScanResult probe_tcp_banner(const std::string& host, int port, double tim
     int sockfd = -1;
     for (auto rp = res; rp; rp = rp->ai_next) {
         sockfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (sockfd < 0) continue;
+        if (sockfd < 0)
+            continue;
         if (rp->ai_family == AF_INET)
             ((sockaddr_in*)rp->ai_addr)->sin_port = htons(port);
         else
             ((sockaddr_in6*)rp->ai_addr)->sin6_port = htons(port);
-        if (connect(sockfd, rp->ai_addr, rp->ai_addrlen) == 0)
+        if (connect(sockfd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            out.reachable = true;
             break;
+        }
         close(sockfd);
         sockfd = -1;
     }
@@ -206,31 +215,33 @@ static ScanResult probe_tcp_banner(const std::string& host, int port, double tim
     }
     set_socket_timeout(sockfd, timeout);
     if (port == 80 || port == 443) {
-        if (port == 443) probe_https(sockfd, host, timeout, out);
-        else {
+        if (port == 443) {
+            probe_https(sockfd, host, timeout, out);
+        } else {
+            std::string userAgent =
+                "Mozilla/5.0 (Windows NT 11.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/134.0.6998.166 Safari/537.36";
             std::ostringstream req;
-            req << "HEAD / HTTP/1.1\r\nHost: " << host << "\r\nUser-Agent: " << userAgent << "\r\n";
-            std::string reqs = req.str();
-            ssize_t sent = send(sockfd, reqs.c_str(), (int)reqs.size(), 0);
-            if (sent < 0) {
-                out.notes.push_back("HTTP send error: " + std::string(strerror(errno)));
-                std::string data = recv_all(sockfd, timeout);
-                out.banner = data;
-            } else {
-                std::string data = recv_all(sockfd, timeout);
-                out.banner = data;
-                parse_http_response(data, out.http_headers, out.notes);
-            }
+            req << "HEAD / HTTP/1.1\r\nHost: " << host
+                << "\r\nUser-Agent: " << userAgent << "\r\n\r\n";
+            send(sockfd, req.str().c_str(), req.str().size(), 0);
+            std::string data = recv_all(sockfd, timeout);
+            out.banner = data;
+            parse_http_response(data, out.http_headers, out.notes);
         }
     } else {
-        std::string data = recv_all(sockfd, timeout);
-        out.banner = data;
+        out.banner = recv_all(sockfd, timeout);
     }
     close(sockfd);
-    out.duration_s = duration<double>(high_resolution_clock::now() - start).count();
+    out.duration_s =
+        duration<double>(high_resolution_clock::now() - start).count();
     return out;
 }
 int main(int argc, char* argv[]) {
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
     if (argc < 2) {
         std::cerr << "Usage:\n"
                   << "  " << argv[0]
@@ -243,13 +254,13 @@ int main(int argc, char* argv[]) {
     std::string json_out;
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--timeout" && i + 1 < argc) {
+        if (arg == "--timeout" && i + 1 < argc)
             timeout = std::stod(argv[++i]);
-        } else if (arg == "--threads" && i + 1 < argc) {
+        else if (arg == "--threads" && i + 1 < argc)
             threads = std::stoul(argv[++i]);
-        } else if (arg == "--json" && i + 1 < argc) {
+        else if (arg == "--json" && i + 1 < argc)
             json_out = argv[++i];
-        } else {
+        else {
             std::cerr << "Unknown or incomplete option: " << arg << "\n";
             return 1;
         }
@@ -299,9 +310,10 @@ int main(int argc, char* argv[]) {
             std::cout << "  - " << n << "\n";
         std::cout << "\n";
     }
+
     if (!json_out.empty()) {
         std::ofstream jf(json_out);
-        jf << "\n  \"results\": [\n";
+        jf << "{\n  \"results\": [\n";
         for (size_t i = 0; i < results.size(); ++i) {
             const auto& r = results[i];
             jf << "    {\n";
@@ -309,7 +321,7 @@ int main(int argc, char* argv[]) {
             jf << "      \"port\": " << r.port << ",\n";
             jf << "      \"reachable\": " << (r.reachable ? "true" : "false") << ",\n";
             jf << "      \"duration\": " << r.duration_s << ",\n";
-            jf << "      \"banner\": \"" << r.banner << "\",\n";
+            jf << "      \"banner\": " << std::quoted(r.banner) << ",\n";
             jf << "      \"headers\": {\n";
             size_t hc = 0;
             for (const auto& h : r.http_headers) {
@@ -328,8 +340,8 @@ int main(int argc, char* argv[]) {
             jf << "    }";
             if (i + 1 < results.size()) jf << ",";
             jf << "\n";
-        }
+        };
         jf << "  ]\n}\n";
-    }
+    };
 };
 //g++ -w sila.cpp -o sila -lssl -lcrypto -pthread 
