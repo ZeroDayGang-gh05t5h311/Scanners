@@ -1,10 +1,10 @@
 #!/usr/bin/python3
 import random, socket, ssl, argparse, logging, json, time, signal, sys, csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict
+from typing import List, to_dict
 DEFAULT_PORTS = "21,22,23,25,53,80,110,143,443,3306,6379,8080,8443"
 BANNER_READ_BYTES = 4096
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 def configure_logging(verbose: bool):
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
@@ -12,6 +12,10 @@ def configure_logging(verbose: bool):
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 class ScanResult:
+    __slots__ = (
+        "host", "port", "reachable", "duration_s", "banner",
+        "http", "tls", "certificate", "notes", "errors"
+    )
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
@@ -28,44 +32,52 @@ class ScanResult:
         return {
             "host": self.host,
             "port": self.port,
-            "reachable": self.reachable,
-            "duration_s": self.duration_s,
-            "banner": self.banner,
-            "http": self.http,
-            "tls": self.tls,
-            "certificate": self.certificate,
-            "notes": self.notes,
-            "errors": self.errors,
+            "reachable": bool(self.reachable),
+            "duration_s": float(round(self.duration_s, 4)),
+            "banner": self.banner or "",
+            "http": self.http or {},
+            "tls": self.tls or {},
+            "certificate": self.certificate or {},
+            "notes": list(self.notes),
+            "errors": list(self.errors),
         }
+
 def parse_ports(port_str: str) -> List[int]:
     ports = set()
     for part in port_str.split(","):
         if "-" in part:
-            start, end = part.split("-", 1)
-            start, end = int(start), int(end)
+            start_str, end_str = part.split("-", 1)
+            start = int(start_str)
+            end = int(end_str)
             if start > end:
                 raise ValueError(f"Invalid port range: {part}")
             ports.update(range(start, end + 1))
         else:
             ports.add(int(part))
     for p in ports:
-        if not (1 <= p <= 65535):
+        if p < 1 or p > 65535:
             raise ValueError(f"Invalid port: {p}")
     return sorted(ports)
+
 def recv_all(sock, timeout: float, max_bytes: int):
     sock.settimeout(timeout)
-    data = b""
+    chunks = []
+    total = 0
     try:
-        while len(data) < max_bytes:
+        while total < max_bytes:
             chunk = sock.recv(4096)
             if not chunk:
                 break
-            data += chunk
-            if b"\r\n\r\n" in data:  # End of headers detected
+            chunks.append(chunk)
+            total += len(chunk)
+            if b"\r\n\r\n" in b"".join(chunks):
                 break
-    except Exception:
-        pass
-    return data.decode(errors="ignore")
+    except socket.timeout:
+        logging.warning("Socket read timed out.")
+    except Exception as e:
+        logging.error(f"Error receiving data: {e}")
+    return b"".join(chunks).decode(errors="ignore")
+
 def parse_http_response(data: str, result: ScanResult):
     lines = data.split("\r\n")
     if not lines:
@@ -77,143 +89,92 @@ def parse_http_response(data: str, result: ScanResult):
         result.http["status_code"] = parts[1]
         if len(parts) == 3:
             result.http["reason"] = parts[2]
-    else:
-        result.notes.append("Malformed HTTP status line")
     for line in lines[1:]:
-        if line == "":
+        if not line:
             break
         if ":" in line:
-            key, value = line.split(":", 1)
-            result.http[key.lower()] = value.strip()
+            k, v = line.split(":", 1)
+            result.http[k.lower()] = v.strip()
 user_agents = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.96 Safari/537.36",  # Google Chrome (Windows)
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:118.0) Gecko/20100101 Firefox/118.0",  # Mozilla Firefox (Windows)
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5_1) AppleWebKit/537.36 (KHTML, like Gecko) Version/16.6 Safari/537.36",  # Apple Safari (MacOS)
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edg/116.0.1938.69 Safari/537.36",  # Microsoft Edge (Windows)
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.96 Safari/537.36 OPR/102.0.4880.77",  # Opera (Windows)
-    "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230805.001) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.96 Mobile Safari/537.36",  # Google Chrome (Android)
-    "Mozilla/5.0 (Android 13; Mobile; rv:118.0) Gecko/118.0 Firefox/118.0",  # Mozilla Firefox (Android)
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/537.36",  # Safari (iPhone)
-    "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230805.001) AppleWebKit/537.36 (KHTML, like Gecko) Edg/116.0.1938.69 Mobile Safari/537.36",  # Microsoft Edge (Android)
-    "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230805.001) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.96 Mobile Safari/537.36 OPR/102.0.4880.77"  # Opera (Android)
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.96 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:118.0) Gecko/20100101 Firefox/118.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5_1) AppleWebKit/537.36 (KHTML, like Gecko) Version/16.6 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edg/116.0.1938.69 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.96 Safari/537.36 OPR/102.0.4880.77",
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230805.001) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.96 Mobile Safari/537.36",
+    "Mozilla/5.0 (Android 13; Mobile; rv:118.0) Gecko/118.0 Firefox/118.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230805.001) AppleWebKit/537.36 (KHTML, like Gecko) Edg/116.0.1938.69 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230805.001) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.96 Mobile Safari/537.36 OPR/102.0.4880.77"
 ]
 def rdmUA():
-    return user_agents[random.randint(0, 9)]
-user_agent = rdmUA()
+    return random.choice(user_agents)
+def starttls_upgrade(sock, host, timeout, insecure, result):
+    try:
+        inspect_tls(sock, host, timeout, insecure, result)
+        result.notes.append("STARTTLS successful")
+    except Exception as e:
+        result.errors.append(f"STARTTLS failed: {e}")
+
 def inspect_tls(sock, host: str, timeout: float, insecure: bool, result: ScanResult):
     context = ssl.create_default_context()
     if insecure:
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
-    try:
-        with context.wrap_socket(sock, server_hostname=host) as tls_sock:
-            tls_sock.settimeout(timeout)
-            tls_sock.do_handshake()
-            result.tls["version"] = tls_sock.version()
-            cipher = tls_sock.cipher()
-            if cipher:
-                result.tls["cipher_suite"] = cipher[0]
-                result.tls["cipher_protocol"] = cipher[1]
-                result.tls["cipher_bits"] = str(cipher[2])
-            cert = tls_sock.getpeercert()
-            if cert:
-                subject = dict(x[0] for x in cert.get("subject", []))
-                issuer = dict(x[0] for x in cert.get("issuer", []))
-                result.certificate["subject_cn"] = subject.get("commonName", "")
-                result.certificate["issuer_cn"] = issuer.get("commonName", "")
-                result.certificate["not_before"] = cert.get("notBefore", "")
-                result.certificate["not_after"] = cert.get("notAfter", "")
-            request = (
-                f"HEAD / HTTP/1.1\r\n"
-                f"Host: {host}\r\n"
-                f"User-Agent: {user_agent}\r\n"
-                f"Connection: close\r\n\r\n"
-            )
-            tls_sock.sendall(request.encode())
-            data = recv_all(tls_sock, timeout, BANNER_READ_BYTES)
-            result.banner = data
-            parse_http_response(data, result)
-    except ssl.SSLError as e:
-        result.errors.append(f"TLS error: {e}")
-    except Exception as e:
-        result.errors.append(f"TLS failure: {e}")
+    with context.wrap_socket(sock, server_hostname=host) as tls_sock:
+        tls_sock.settimeout(timeout)
+        tls_sock.do_handshake()
+
+        result.tls["version"] = tls_sock.version()
+        cipher = tls_sock.cipher()
+        if cipher:
+            result.tls["cipher_suite"] = cipher[0]
+            result.tls["cipher_protocol"] = cipher[1]
+            result.tls["cipher_bits"] = str(cipher[2])
+
+        cert = tls_sock.getpeercert()
+        if cert:
+            subject = dict(x[0] for x in cert.get("subject", []))
+            issuer = dict(x[0] for x in cert.get("issuer", []))
+            result.certificate["subject_cn"] = subject.get("commonName", "")
+            result.certificate["issuer_cn"] = issuer.get("commonName", "")
+            result.certificate["not_before"] = cert.get("notBefore", "")
+            result.certificate["not_after"] = cert.get("notAfter", "")
+
 def probe(host: str, port: int, timeout: float, insecure: bool) -> ScanResult:
     result = ScanResult(host, port)
     start = time.time()
     try:
         sock = socket.create_connection((host, port), timeout=timeout)
         result.reachable = True
-    except Exception:
+    except Exception as e:
+        result.errors.append(str(e))
         result.duration_s = time.time() - start
-        result.errors.append("Connection failed")
         return result
-    result.duration_s = time.time() - start
     try:
-        # TLS Service Detection
-        if port in (443, 8443):
+        banner = recv_all(sock, timeout, BANNER_READ_BYTES)
+        result.banner = banner
+        if port == 25 and banner.startswith("220"):
+            sock.sendall(b"EHLO scanner\r\n")
+            if "STARTTLS" in recv_all(sock, timeout, BANNER_READ_BYTES).upper():
+                sock.sendall(b"STARTTLS\r\n")
+                recv_all(sock, timeout, BANNER_READ_BYTES)
+                starttls_upgrade(sock, host, timeout, insecure, result)
+        elif port == 110 and banner.startswith("+OK"):
+            sock.sendall(b"STLS\r\n")
+            if recv_all(sock, timeout, BANNER_READ_BYTES).startswith("+OK"):
+                starttls_upgrade(sock, host, timeout, insecure, result)
+        elif port == 143 and "IMAP" in banner.upper():
+            sock.sendall(b"a001 STARTTLS\r\n")
+            if "OK" in recv_all(sock, timeout, BANNER_READ_BYTES).upper():
+                starttls_upgrade(sock, host, timeout, insecure, result)
+        elif port in (443, 8443):
             inspect_tls(sock, host, timeout, insecure, result)
-        # HTTP Service Detection (ports 80 and 8080)
         elif port in (80, 8080):
-            request = (
-                f"HEAD / HTTP/1.1\r\n"
-                f"Host: {host}\r\n"
-                f"User-Agent: {user_agent}\r\n"
-                f"Connection: close\r\n\r\n"
+            sock.sendall(
+                f"HEAD / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {rdmUA()}\r\n\r\n".encode()
             )
-            sock.sendall(request.encode())
-            data = recv_all(sock, timeout, BANNER_READ_BYTES)
-            result.banner = data
-            parse_http_response(data, result)
-        # Additional detection for common services
-        elif port == 21:  # FTP
-            request = "USER anonymous\r\nPASS anonymous\r\n"
-            sock.sendall(request.encode())
-            data = recv_all(sock, timeout, BANNER_READ_BYTES)
-            result.banner = data
-            if "220" in data:
-                result.notes.append("FTP service detected")
-        elif port == 22:  # SSH
-            data = recv_all(sock, timeout, BANNER_READ_BYTES)
-            result.banner = data
-            if "SSH" in data:
-                result.notes.append("SSH service detected")
-        elif port == 23:  # Telnet
-            data = recv_all(sock, timeout, BANNER_READ_BYTES)
-            result.banner = data
-            if "Telnet" in data:
-                result.notes.append("Telnet service detected")
-        elif port == 25:  # SMTP
-            data = recv_all(sock, timeout, BANNER_READ_BYTES)
-            result.banner = data
-            if "220" in data:
-                result.notes.append("SMTP service detected")
-        elif port == 53:  # DNS
-            request = b"\x00\x00\x00\x00\x00\x00\x00\x00"
-            sock.sendall(request)
-            data = recv_all(sock, timeout, BANNER_READ_BYTES)
-            result.banner = data
-            if "DNS" in data:
-                result.notes.append("DNS service detected")
-        elif port == 110:  # POP3
-            data = recv_all(sock, timeout, BANNER_READ_BYTES)
-            result.banner = data
-            if "POP3" in data:
-                result.notes.append("POP3 service detected")
-        elif port == 143:  # IMAP
-            data = recv_all(sock, timeout, BANNER_READ_BYTES)
-            result.banner = data
-            if "IMAP" in data:
-                result.notes.append("IMAP service detected")
-        elif port == 3306:  # MySQL
-            data = recv_all(sock, timeout, BANNER_READ_BYTES)
-            result.banner = data
-            if "MySQL" in data:
-                result.notes.append("MySQL service detected")
-        elif port == 6379:  # Redis
-            data = recv_all(sock, timeout, BANNER_READ_BYTES)
-            result.banner = data
-            if "Redis" in data:
-                result.notes.append("Redis service detected")
+            parse_http_response(recv_all(sock, timeout, BANNER_READ_BYTES), result)
     except Exception as e:
         result.errors.append(str(e))
     finally:
@@ -221,6 +182,7 @@ def probe(host: str, port: int, timeout: float, insecure: bool) -> ScanResult:
             sock.close()
         except Exception:
             pass
+    result.duration_s = time.time() - start
     return result
 def setup_signal_handler():
     def handler(sig, frame):
